@@ -1,0 +1,79 @@
+[package]
+name = "piphone"
+version = "1.0.0"
+authors = ["Steffen Manzer"]
+edition = "2021"
+rust-version = "1.91"
+description = "Headless SIP telephone inside a historical rotary dial phone (Raspberry Pi Zero 2W)"
+license = "MIT"
+
+[[bin]]
+name = "piphone"
+path = "src/main.rs"
+
+[lib]
+name = "piphone"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime - also required by rvoip
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "signal",
+    "process",
+    "fs",
+] }
+
+# SIP stack - replaces linphonec
+rvoip = "0.3.12"
+
+# Web interface
+axum = "0.8"
+
+# Configuration and JSON
+toml = "1"
+# `preserve_order` keeps JSON object keys in insertion order, which the web
+# interface relies on to list validation errors in schema order.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Schema pattern matching (config.rs), TOML key formatting
+regex = "1"
+
+# Local time, weekday, next wake-up calculation
+chrono = { version = "0.4", features = ["clock"] }
+
+# Randomised sleep-music order
+rand = "0.9"
+
+# HTTP Basic Auth decoding
+base64 = "0.23"
+
+# Hardware. Both crates are Linux-only and need the corresponding system
+# libraries, which Raspberry Pi OS provides (libgpiod, libasound2).
+[target.'cfg(target_os = "linux")'.dependencies]
+
+# Rotary dial, hook switch and LEDs via the GPIO character device
+gpiod = "0.3"
+
+# Call audio via the USB sound card (earpiece + microphone)
+alsa = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+# Drives the axum router in-process, so the HTTP tests need no port and no
+# external client.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+# https://github.com/johnthagen/min-sized-rust
+[profile.release]
+opt-level = "s"     # Optimize for *speed*
+lto = true          # Enable link-time optimization
+codegen-units = 1   # Reduce number of codegen units to increase optimizations
+panic = 'abort'     # Abort on panic
+strip = true        # Strip symbols from binary

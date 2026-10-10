@@ -1,0 +1,11 @@
+{
+  "name": "piphone-webpage-tests",
+  "private": true,
+  "description": "DOM tests for the configuration page (tests/test-webpage.js)",
+  "scripts": {
+    "test": "node tests/test-webpage.js"
+  },
+  "devDependencies": {
+    "jsdom": "^26.0.0"
+  }
+}

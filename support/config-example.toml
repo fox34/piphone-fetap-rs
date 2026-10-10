@@ -1,0 +1,106 @@
+# Diese Datei muss nach /boot/piphone/config.toml, um auch in einem RO-Dateisystem angepasst werden zu können
+#
+# Die Datei lässt sich auch im Webinterface des Telefons bearbeiten (/config). Beim Speichern
+# wird sie aus dem Schema in lib/config.py neu geschrieben: Die Kommentare entstehen dabei neu,
+# eigene Kommentare werden nicht beibehalten.
+
+[network]
+wifi_test_host = "10.0.0.1"
+
+[sip]
+host = "10.0.0.1"
+user = "test"
+pass = "test"
+
+# Wie lange darf ein Wählvorgang dauern, bis er automatisch abgebrochen wird (Sekunden)
+dial_timeout = 60
+
+# Klingelsperre ab welcher Stunde am Abend (0 = deaktiviert)
+dnd_from = 20
+
+# Klingelsperre bis zu welcher Stunde am Morgen (0 = deaktiviert)
+dnd_to = 8
+
+# Weist automatisch alle Anrufer ab, die nicht in [numbers] hinterlegt sind
+whitelist_active = false
+
+# Beendet ausgehende Anrufe automatisch nach X Minuten (0 = deaktiviert)
+max_call_duration = 15
+
+[pins]
+# Nummern-Schalter-Impuls-Kontakt
+nsi = 23
+
+# Nummern-Schalter-Arbeits- (oder Abschalte-)Kontakt
+nsa = 24
+
+# Gabelkontakt
+gabel = 15
+
+[numbers]
+# Gültige Rufnummern (Kurzwahlen) oder Kurzbefehle
+# Kurzbefehle: shutdown, reboot, enable-night-mode, play-sleep-music, test-loudspeaker, test-earpiece
+"11" = "enable-night-mode"
+"12" = "play-sleep-music"
+"18" = "reboot"
+"19" = "shutdown"
+"21" = "test-loudspeaker"
+"22" = "test-earpiece"
+
+"01" = "01234567"
+"02" = "02345678"
+"03" = "03456789"
+
+[ringtones]
+# Rufnummerspezifische Klingeltöne
+"08912345" = "/opt/piphone/sounds/ring-02.wav"
+
+[sounds]
+boot = "/opt/piphone/sounds/boot-loud.wav"
+reboot = "/opt/piphone/sounds/reboot-loud.wav"
+shutdown = "/opt/piphone/sounds/shutdown-loud.wav"
+
+# Generischer Klingelton
+ring = "/opt/piphone/sounds/ring-01.wav"
+
+test_earpiece = "/opt/piphone/sounds/test-earpiece.wav"
+test_loud = "/opt/piphone/sounds/test-loud.wav"
+
+waehlen_frei = "/opt/piphone/sounds/waehlen-frei.mp3"
+waehlen_besetzt = "/opt/piphone/sounds/waehlen-besetzt.mp3"
+waehlen_ungueltig = "/opt/piphone/sounds/waehlen-ungueltig.mp3"
+waehlen_nicht_verbunden = "/opt/piphone/sounds/waehlen-nicht-verbunden.mp3"
+
+action_confirmed = "/opt/piphone/sounds/confirm.wav"
+
+# Einschlafmusik: mehrere Dateien werden in zufälliger Reihenfolge abgespielt.
+# Beispieldatei aus urheberrechtlichen Gründen nicht in Repository
+sleep_music = ["/opt/piphone/sounds/sleep-Brahms_Lullaby.mp3"]
+
+# Nachtmodus / Aufwachlicht
+[misc]
+# GPIO-Pin für Nachtlicht (0 = deaktiviert)
+night_light_pin = 0
+
+# Nachtlicht: Helligkeit in Prozent (100 = PWM deaktiviert, volle Leistung des GPIO)
+night_light_duty = 50
+
+# GPIO-Pin für Aufwach-Licht (0 = deaktiviert)
+wake_light_pin = 0
+
+# Aufwach-Licht: Helligkeit in Prozent (100 = PWM deaktiviert, volle Leistung des GPIO)
+wake_light_duty = 100
+
+# Uhrzeiten zum Aufstehen: Mo, Di, Mi, Do, Fr, Sa, So (Lokalzeit, ggf. inkl. Sommerzeit).
+wake_up_times = ["06:30", "06:30", "06:30", "06:30", "06:30", "07:30", "07:30"]
+
+# Webserver zur Anzeige und Steuerung des Telefons (im WLAN erreichbar)
+[web]
+# Port des Webservers, 0 = deaktiviert
+port = 0
+
+# Optionaler Zugangsschutz (HTTP Basic Auth).
+# Achtung: Ohne Zugangsschutz kann jeder im WLAN das Telefon herunterfahren!
+# Leere Felder = kein Zugangsschutz
+user = ""
+pass = ""
