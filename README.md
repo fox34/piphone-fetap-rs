@@ -1,22 +1,22 @@
 # FeTAp611-VoIP-Tischtelefon auf Basis eines Raspberry Pi Zero 2 W
 
-Diese Fassung ist die Rust-Neuschreibung von `../python-3.13`. Statt `linphonec` als Unterprozess
-zu starten, bringt das Programm den SIP-Stack als `rvoip`-Crate mit. Verhalten, Konfiguration und
-Weboberfläche sind ansonsten identisch geblieben.
+Diese Version ist die Rust-Portierung von [https://github.com/fox34/piphone-fetap](piphone-fetap).
+Statt `linphonec` als Unterprozess zu starten, bringt das Programm den SIP-Stack als 
+`rvoip`-Crate mit. Verhalten, Konfiguration und Weboberfläche sind identisch.
 
 Komponenten:
 
 - FeTAp 611, nötige Originalkomponenten: Nummernschalter und Gabelkontakt
 - Raspberry Pi Zero 2 W
-- Netzteil: z.B. Hi-Link 5V, 3W (600mA)<br>
-  *Hinweis: 3W/600mA sind eher knapp dimensioniert und setzen eine Drosselung des Pi voraus. Besser sind 5W/1A.*
-- Verstärker für Lautsprecher: MAX98357A (auf fertiger Platine für I2S)
+- Netzteil: z. B. Hi-Link 5V, 3W (600mA)<br>
+  *Hinweis: 3W/600mA sind knapp dimensioniert und setzen eine Drosselung des Pi voraus. Besser sind 5W/1A.*
+- Verstärker für Lautsprecher: MAX98357A (bspw. auf fertiger Platine mit I2S)
 - Lautsprecher: Visaton FR7, 4 Ohm, 5W Nennleistung
 - USB-OTG-Adapter (Mikro-USB auf USB-A)
 - USB-Soundkarte (einfacher/günstiger zu finden als USB-OTG-Soundkarte)
   hier: Vention = ID 0d8c:0014 C-Media Electronics, Inc. Audio Adapter (Unitek Y-247A)
-- Hörer-Lautsprecher aus altem Headset
-- Hörer-Mikrofon aus altem Headset
+- Hörer-Lautsprecher, bspw. aus altem Headset
+- Hörer-Mikrofon, bspw. aus altem Headset
 
 # Verkabelung
 
@@ -34,7 +34,7 @@ Komponenten:
 |  | 3 (nsa1) | GND | 20 |
 |  | 4 (nsa2) | 24 | 18 |
 
-Die beiden LEDs (Nachtlicht, Aufwachlicht) werden über die Optionen `night_light_pin` und
+Optional verbaute LEDs (Nachtlicht, Aufwachlicht) werden über die Optionen `night_light_pin` und
 `wake_light_pin` im Bereich `[pins]` konfiguriert.
 
 # Linux konfigurieren
@@ -52,14 +52,14 @@ und eine Rust-Toolchain (`rustup`).
 
 ## Konfigurationsdatei
 
-Die Konfiguration sollte als TOML-Datei bspw. unter `/boot/piphone/config.toml` abgelegt werden, damit sie auch in einem
+Die Konfiguration sollte bspw. unter `/boot/piphone/config.toml` abgelegt werden, damit sie auch in einem
 schreibgeschützten Root-Dateisystem (bspw. OverlayFS) angepasst werden kann. Eine vollständig kommentierte Vorlage
 gibt es in `support/config-example.toml`.
 
 ```
 sudo mkdir -p /boot/piphone
 sudo cp support/config-example.toml /boot/piphone/config.toml
-sudo nano /boot/piphone/config.toml
+sudo vim /boot/piphone/config.toml
 ```
 
 Ein anderer Pfad kann über `-c/--config` angegeben werden.
@@ -168,8 +168,8 @@ ctl.i2s {
 
 > **Hinweis zum Gesprächsaudio:** Für Gespräche öffnet der Code die USB-Soundkarte als `plug:usb`,
 > nicht als `usb`. Dieser C-Media-Codec kann nur 44,1 oder 48 kHz und nur einen Kanal. G.711 im
-> SIP-Stack arbeitet dagegen mit 8 kHz. Ohne den `plug`-Wrapper lehnt ALSA diese Rate ab; mit ihm
-> übernimmt alsa-lib die Umwandlung, sodass der SIP-Stack bei seinen 8 kHz bleibt.
+> SIP-Stack arbeitet dagegen mit 8 kHz. Ohne den `plug`-Wrapper lehnt ALSA diese Konfiguration ab.
+> Mit Wrapper übernimmt alsa-lib die Umwandlung, sodass der SIP-Stack bei seinen 8 kHz bleibt.
 >
 > Die Signale im Hörer (`waehlen-frei` und die beiden Testtöne) laufen weiterhin über `usb`, weil die
 > Dateien dort bereits im Format der Karte vorliegen. ALSA kann eine USB-Karte nicht an zwei
@@ -214,8 +214,8 @@ sudo alsactl store
 
 # Bauen und installieren
 
-Der Pi Zero ist für die Rust-Kompilierung zu klein; `rustc` wird beim `rvoip`-Abhängigkeitsbaum
-vom Kernel beendet. Auf einem größeren Rechner bauen und das Binary übertragen:
+Der Pi Zero 2W ist für die Rust-Kompilierung zu klein; `rustc` wird beim `rvoip`-Abhängigkeitsbaum
+vom Kernel gekillt. Daher auf einem stärkeren Linux-Rechner bauen und das Binary übertragen:
 
 ```
 cargo build --release
@@ -260,59 +260,22 @@ pass = ""
 
 Anschließend ist das Telefon im WLAN unter `http://<IP-Adresse-des-Pi>` erreichbar.
 
-### Statusseite (`/`)
+## Nacht- und Aufwachlicht
 
-Angezeigt werden die Laufzeit, der Verbindungs- und Gesprächsstatus sowie der Zustand von
-Nachtlicht, Aufwachmodus, Einschlafmusik, Klingelsperre und der nächsten Aufstehzeit.
-Per Schaltflächen lassen sich Nachtmodus und Einschlafmusik ein- und ausschalten,
-Lautsprecher und Hörer testen sowie das Telefon neu starten oder herunterfahren.
+Es können über die Konfigurationsoptionen im Bereich `[misc]` sowohl eine Nachtlicht- als auch eine Aufwachlicht-LED konfiguriert werden.
+Über die Kurzwahl `enable-night-mode` wird dann das Nachtlicht bis zur konfigurierten Uhrzeit aktiviert.
 
-> **Achtung:** Der Webserver ist unverschlüsselt und erlaubt das Herunterfahren des Telefons.
-> Im WLAN daher möglichst durch eine Zugangskontrolle (Firewall, separates VLAN) schützen.
-> Für die Konfigurationsseite gilt das erst recht.
+## Schlafmusik
 
-Alternativ lässt sich der Webserver auch per `--no-web` deaktivieren.
+Über die Kurzwahl `start-sleep-music` wird die Spieluhr aktiviert. Die Spieluhr stoppt, sobald der Hörer abgehoben wird.
 
-### Konfigurationsseite (`/config`)
+## Hinweise zur GPIO-Anbindung
 
-Auf `/config` lässt sich die komplette TOML-Datei über Formulare bearbeiten - alle Abschnitte
-und Optionen der Konfigurationsdatei. Dazu gehören:
-
-- alle festen Optionen aus `[network]`, `[sip]`, `[pins]`, `[sounds]`, `[misc]` und `[web]`,
-  jeweils mit Beschreibung und, wo sinnvoll, mit Grenzwerten (Pflichtfelder, GPIOPins 0-27,
-  Stunden 0-23, Helligkeit 0-100, Port 0-65535)
-- `[numbers]`: Kurzwahlen und Kurzbefehle als Tabelle, Zeilen lassen sich hinzufügen und entfernen,
-  die gültigen Kurzbefehle werden als Vorschläge angeboten
-- `[ringtones]`: rufnummerspezifische Klingeltöne, ebenfalls hinzufüg- und entfernbar
-- Listen wie `sleep_music` und `wake_up_times`: ein Eintrag je Zeile
-
-Eingaben werden vor dem Speichern geprüft, Fehler erscheinen direkt am betroffenen Feld.
-Getestet wird die geschriebene Datei anschließend noch einmal - nur wenn sie gültiges TOML mit
-den erwarteten Werten ist, ersetzt sie die alte Datei.
-
-> **Neustart erforderlich:** Änderungen wirken erst nach einem Neustart des Telefons, da GPIO-Pins,
-> SIP-Zugangsdaten und der Webserver nur beim Start eingerichtet werden. Das Telefon startet sich
-> deshalb **nicht** von selbst neu. Die Oberfläche weist nach dem Speichern darauf hin, auf der
-> Statusseite steht "Konfiguration: Geändert, Neustart nötig", und `/config` bietet eine
-> Neustart-Schaltfläche an.
-
-#### Kommentare in der Konfigurationsdatei
-
-Beim Speichern wird die Datei aus dem Schema in `src/config.rs` neu geschrieben. Jede Option
-erhält dabei wieder ihren erklärenden Kommentar, damit die Datei weiterhin gut lesbar bleibt.
-
-Eigene Kommentare werden dabei **nicht beibehalten**: Sie gehen beim Speichern verloren.
-Wer Kommentare dauerhaft behalten möchte, sollte sie nach dem Speichern erneut einfügen oder
-die Kommentare in `src/config.rs` ergänzen.
-
-#### Schnittstellen
-
-| Aufruf | Zweck |
-| :--- | :--- |
-| `GET /api/state` | Status als JSON |
-| `GET /api/config` | Schema und aktuelle Werte als JSON |
-| `POST /api/config` | Konfiguration als JSON speichern, antwortet mit `{"ok":true,"changed":[...]}` oder `{"ok":false,"errors":{...}}` |
-| `POST /api/action/<name>` | Aktion auslösen |
+- Die Pins werden über `gpiod` angesprochen, weil die Verkabelung einen Pull-up braucht.
+- Die Impulse werden im 1-ms-Takt abgefragt statt über Flankenerkennung, damit die Lösung auch mit
+  libgpiod 1.x und 2.x funktioniert.
+- Fehlt `libgpiod-dev`, lässt sich das Projekt auf einem Raspberry Pi OS nicht bauen. Für
+  andere Systemen gibt es eine Ersatzimplementierung, mit der die Tests ohne Hardware laufen.
 
 ## Tests
 
@@ -329,8 +292,6 @@ npm install jsdom
 node tests/test-webpage.js
 ```
 
-Auf einem Pi muss `cargo test -j 1` verwendet werden, weil der Linker der Speicher-Höhepunkt ist.
-
 ### Hardware-Testwerkzeuge
 
 Diese sind nur für die Inbetriebnahme am Telefon gedacht. Jedes öffnet die Pins, die es braucht,
@@ -343,20 +304,3 @@ cargo run --example hardware-audio         # Klingeltöne, Lautsprecher, Hörer,
 cargo run --example gpio-probe             # rohe Pin-Pegel, zur Fehlersuche in der Verkabelung
 cargo run --release --example audio-probe -- plug:usb 8000 1   # ALSA-Parameter durchprobieren
 ```
-
-## Nacht- und Aufwachlicht
-
-Es können über die Konfigurationsoptionen im Bereich `[misc]` sowohl eine Nachtlicht- als auch eine Aufwachlicht-LED konfiguriert werden.
-Über die Kurzwahl `enable-night-mode` wird dann das Nachtlicht bis zur konfigurierten Uhrzeit aktiviert.
-
-## Schlafmusik
-
-Über die Kurzwahl `start-sleep-music` wird die Spieluhr aktiviert. Die Spieluhr stoppt, sobald der Hörer abgehoben wird.
-
-## Hinweise zur GPIO-Anbindung
-
-- Die Pins werden über `gpiod` angesprochen, weil die Verkabelung einen Pull-up braucht.
-- Die Impulse werden im 1-ms-Takt abgefragt statt über Flankenerkennung, damit die Lösung auch mit
-  libgpiod 1.x und 2.x funktioniert.
-- Fehlt `libgpiod-dev`, lässt sich das Projekt auf einem Raspberry Pi OS gar nicht bauen. Auf
-  anderen Systemen gibt es eine Ersatzimplementierung, mit der die Tests ohne Hardware laufen.
