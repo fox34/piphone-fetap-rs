@@ -459,18 +459,6 @@ pub static SECTIONS: LazyLock<Vec<SectionSpec>> = LazyLock::new(|| {
                 OptionSpec::new("test_loud", "Test Lautsprecher", ValueType::String)
                     .default(str_val(""))
                     .comment(&["Testton über den Lautsprecher."]),
-                OptionSpec::new("waehlen_frei", "Freizeichen", ValueType::String)
-                    .default(str_val(""))
-                    .comment(&["Freizeichen beim Abheben des Hörers."]),
-                OptionSpec::new("waehlen_besetzt", "Besetzt", ValueType::String)
-                    .default(str_val(""))
-                    .comment(&["Besetztton, auch bei Timeout und beendeten Gesprächen."]),
-                OptionSpec::new("waehlen_ungueltig", "Ungültige Kurzwahl", ValueType::String)
-                    .default(str_val(""))
-                    .comment(&["Klang bei einer zu langen Ziffernfolge."]),
-                OptionSpec::new("waehlen_nicht_verbunden", "Nicht verbunden", ValueType::String)
-                    .default(str_val(""))
-                    .comment(&["Besetztton, wenn beim Abheben kein SIP-Client bereitsteht."]),
                 OptionSpec::new("action_confirmed", "Bestätigung", ValueType::String)
                     .default(str_val(""))
                     .comment(&["Klang zur Bestätigung eines Kurzbefehls."]),

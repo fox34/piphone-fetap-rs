@@ -66,10 +66,6 @@ ring = "/opt/piphone/sounds/ring-01.wav"
 test_earpiece = "/opt/piphone/sounds/test-earpiece.wav"
 test_loud = "/opt/piphone/sounds/test-loud.wav"
 
-waehlen_frei = "/opt/piphone/sounds/waehlen-frei.mp3"
-waehlen_besetzt = "/opt/piphone/sounds/waehlen-besetzt.mp3"
-waehlen_ungueltig = "/opt/piphone/sounds/waehlen-ungueltig.mp3"
-waehlen_nicht_verbunden = "/opt/piphone/sounds/waehlen-nicht-verbunden.mp3"
 
 action_confirmed = "/opt/piphone/sounds/confirm.wav"
 

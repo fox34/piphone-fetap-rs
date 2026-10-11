@@ -15,7 +15,7 @@ use rand::seq::SliceRandom;
 use serde_json::Value as Json_;
 use tokio::sync::mpsc;
 
-use crate::audio::Audio;
+use crate::audio::{Audio, Tone};
 use crate::config::{self, Table};
 use crate::gpio::{Gpio, Led, Watcher};
 use crate::sip::{CallDecision, SipClient, SipEvent};
@@ -119,6 +119,12 @@ pub struct Phone {
 pub enum SipCommand {
     /// Place a call to a number.
     Call { number: String, host: String },
+    /// Open the sound card for the call that was just answered.
+    ///
+    /// Sent by the phone rather than done by the SIP stack, because both want the
+    /// same card: the earpiece tone has to be stopped before the conversation can
+    /// take it, and only the phone knows when that has happened.
+    StartCallAudio,
     /// End the current call.
     Hangup,
     /// Shut the SIP stack down.
@@ -279,7 +285,7 @@ impl Phone {
             digits.clear();
             drop(digits);
             self.stop_dial_timeout();
-            self.audio.play_earpiece(&self.sound("waehlen_ungueltig"));
+            self.audio.play_earpiece_tone(Tone::Ungueltig);
             return;
         }
 
@@ -323,15 +329,26 @@ impl Phone {
             }
             number => {
                 if !self.is_connected.load(Ordering::SeqCst) {
-                    self.audio.play_earpiece(&self.sound("waehlen_besetzt"));
+                    self.audio.play_earpiece_tone(Tone::Besetzt);
                     return;
                 }
                 println!("Rufe Nummer an: {}", number);
                 let host = config::option_str(&self.config, "sip", "host");
+
+                // The number is complete, so the time to enter one is over. The
+                // old timer would otherwise fire in the middle of the call and
+                // put the busy tone into the conversation.
+                self.stop_dial_timeout();
+
                 self.send_command(SipCommand::Call {
                     number: number.to_string(),
                     host,
                 });
+
+                // Nothing comes back from the other end while it is still
+                // ringing, so the caller hears the ringback until the call is
+                // answered or ends. Both stop it again.
+                self.audio.play_earpiece_tone(Tone::Freiton);
 
                 // Limit the length of outgoing calls.
                 let minutes = config::option_int(&self.config, "sip", "max_call_duration");
@@ -378,14 +395,14 @@ impl Phone {
         self.dial_digits.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.stop_dial_timeout();
         // Repeats, because there is nobody around to pick the handset up.
-        self.audio.play_earpiece_repeat(&self.sound("waehlen_besetzt"));
+        self.audio.play_earpiece_tone(Tone::Besetzt);
     }
 
     /// End an outgoing call that ran past its limit.
     fn timeout_call(self: &Arc<Self>) {
         println!("Maximale Telefondauer erreicht. Gespräch wird beendet.");
         self.send_command(SipCommand::Hangup);
-        self.audio.play_earpiece(&self.sound("waehlen_besetzt"));
+        self.audio.play_earpiece_tone(Tone::Besetzt);
     }
 
     // ---------------------------------------------------------------- hook switch
@@ -423,9 +440,9 @@ impl Phone {
 
             // Dial tone, but only when telephony is actually available.
             if self.is_connected.load(Ordering::SeqCst) {
-                self.audio.play_earpiece(&self.sound("waehlen_frei"));
+                self.audio.play_earpiece_tone(Tone::Frei);
             } else {
-                self.audio.play_earpiece(&self.sound("waehlen_nicht_verbunden"));
+                self.audio.play_earpiece_tone(Tone::NichtVerbunden);
             }
 
             self.dial_digits.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -440,8 +457,13 @@ impl Phone {
         match event {
             SipEvent::IncomingCall { caller, reply } => self.incoming_call(&caller, reply).await,
             SipEvent::CallAnswered => {
+                // The conversation wants the same sound card as the ringback, and
+                // ALSA gives it to whoever opens it first. So the tone goes first,
+                // and only then is the card handed over for the call.
+                self.audio.stop_earpiece();
                 self.call_incoming.store(false, Ordering::SeqCst);
                 self.call_up.store(true, Ordering::SeqCst);
+                self.send_command(SipCommand::StartCallAudio);
                 self.on_sip_ready();
             }
             SipEvent::CallEnded => self.hung_up(),
@@ -571,9 +593,11 @@ impl Phone {
             handle.abort();
         }
 
-        // The handset is off the cradle: it is waiting for the next number.
+        // The handset is off the cradle: it is waiting for the next number. The
+        // tone repeats until the handset goes back down, so it does not run out
+        // while nobody is there to pick it up again.
         if !was_ringing && !self.is_hungup() {
-            self.audio.play_earpiece(&self.sound("waehlen_besetzt"));
+            self.audio.play_earpiece_tone(Tone::Besetzt);
         }
     }
 

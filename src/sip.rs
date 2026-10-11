@@ -19,6 +19,7 @@ use rvoip::sip::{
     EndpointProfile, EndpointRegistrationStatus,
 };
 
+use crate::callaudio;
 use crate::phone::SipCommand;
 
 /// G.711 in SIP runs at 8 kHz; frames are 20 ms.
@@ -92,6 +93,13 @@ pub trait AudioBridge: Send + Sync {
     fn sample_rate(&self) -> u32 {
         SAMPLE_RATE
     }
+    /// Give up whatever the bridge holds, now rather than on the last drop.
+    ///
+    /// Called when the call ends. A bridge that holds a sound card has to have
+    /// released it by the time this returns, because the phone plays the dial
+    /// tone on the very same card straight afterwards. Idempotent; bridges that
+    /// hold nothing can leave it alone.
+    fn stop(&self) {}
 }
 
 /// Errors surfaced by the SIP layer.
@@ -177,6 +185,15 @@ pub struct SipClient {
     current_call: Arc<std::sync::Mutex<Option<EndpointCall>>>,
     /// ALSA device for call audio, opened per call rather than held open.
     audio_device: &'static str,
+    /// Who holds the sound card, so it can be given back when the call ends.
+    call_audio: Arc<callaudio::CallAudio>,
+    /// Whether the current call already has its bridge.
+    ///
+    /// An answered incoming call gets its bridge as part of answering, so the
+    /// phone's go-ahead must not start a second one - the card is only good for
+    /// one, and the loser of that race would take the audio away from the
+    /// conversation that is already running on it.
+    call_audio_started: Arc<AtomicBool>,
     /// Identifier of the outgoing call we placed, if any.
     ///
     /// The `CallAnswered` event carries an `EndpointCall` built from a handle
@@ -238,6 +255,8 @@ impl SipClient {
             call_active: Arc::new(AtomicBool::new(false)),
             current_call: Arc::new(std::sync::Mutex::new(None)),
             audio_device,
+            call_audio: Arc::new(callaudio::CallAudio::default()),
+            call_audio_started: Arc::new(AtomicBool::new(false)),
             outgoing_id: std::sync::Mutex::new(None),
             verbose,
         })
@@ -277,28 +296,61 @@ impl SipClient {
     }
 
     /// Forget every trace of a finished call.
-///
-/// The outgoing id is dropped too: it survives until the call is answered, and
-/// keeping it after the call is over would let a later hangup wrap a dead id.
-fn forget_call(&self) {
-    *self.current_call.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *self.outgoing_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    self.call_active.store(false, Ordering::SeqCst);
-}
+    ///
+    /// The outgoing id is dropped too: it survives until the call is answered,
+    /// and keeping it after the call is over would let a later hangup wrap a
+    /// dead id.
+    ///
+    /// The sound card goes back as well, and it has to go back *here*: the
+    /// caller of this function reports the end of the call to the phone right
+    /// after, and the phone answers that by playing the busy tone - on the very
+    /// card the conversation was using. Waiting for the audio pump to notice on
+    /// its own would be a race that the tone loses, and a silent earpiece is
+    /// exactly what a busy tone is for. This blocks for at most the length of
+    /// one audio buffer while the ALSA threads let go.
+    fn forget_call(&self) {
+        *self.current_call.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.outgoing_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.call_active.store(false, Ordering::SeqCst);
+        self.call_audio_started.store(false, Ordering::SeqCst);
+        self.call_audio.release();
+    }
 
-/// Remember a call as the current one and attach the audio bridge.
+    /// Remember a call as the current one, without touching the sound card.
     ///
     /// For a call we placed, the handle is rebuilt from the stored id; for an
     /// answered incoming call the one from `answer()` is authoritative already.
-    fn track_call(&self, call: &EndpointCall) {
+    fn remember_call(&self, call: &EndpointCall) {
         let handle = match self.outgoing_id.lock().unwrap_or_else(|e| e.into_inner()).take() {
             Some(id) => self.control.wrap_call(id),
             None => call.clone(),
         };
 
-        *self.current_call.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle.clone());
+        *self.current_call.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
         self.call_active.store(true, Ordering::SeqCst);
-        crate::callaudio::start(handle, self.audio_device, self.verbose);
+    }
+
+    /// Open the sound card for the call that is up.
+    ///
+    /// The phone asks for this with [`SipCommand::StartCallAudio`] once it has
+    /// freed the earpiece, because the tone and the conversation want the same
+    /// card: opening it here, the moment the call is answered, would race the
+    /// ringback tone that is still playing and hand the conversation a device
+    /// that is busy. Ignored if the call is already over, or if a bridge is
+    /// running already.
+    fn start_call_audio(&self) {
+        if self.call_audio_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let call = self.current_call.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(call) = call else {
+            // The call ended before the phone got round to opening the card.
+            self.call_audio_started.store(false, Ordering::SeqCst);
+            return;
+        };
+
+        callaudio::start(call, self.audio_device, self.verbose, self.call_audio.clone());
     }
 
     /// End the current call, if there is one.
@@ -402,9 +454,11 @@ fn forget_call(&self) {
                 if let Err(e) = self.call(&number, &host).await {
                     println!("{}", e);
                     // A failed call still ends, so the phone can play busy tone.
+                    self.forget_call();
                     let _ = events.send(SipEvent::CallEnded).await;
                 }
             }
+            SipCommand::StartCallAudio => self.start_call_audio(),
             SipCommand::Hangup => self.hangup().await,
             SipCommand::Shutdown => return false,
         }
@@ -423,6 +477,8 @@ fn forget_call(&self) {
                     events: events.clone(),
                     current_call: self.current_call.clone(),
                     call_active: self.call_active.clone(),
+                    call_audio: self.call_audio.clone(),
+                    call_audio_started: self.call_audio_started.clone(),
                     audio_device: self.audio_device,
                     verbose: self.verbose,
                 };
@@ -432,7 +488,9 @@ fn forget_call(&self) {
                 if self.verbose {
                     println!("<-- SIP: Anruf angenommen, Gespräch läuft");
                 }
-                self.track_call(&call);
+                // Only remembered here: the phone opens the sound card once it
+                // has freed the earpiece, so the two do not fight over it.
+                self.remember_call(&call);
                 let _ = events.send(SipEvent::CallAnswered).await;
             }
             EndpointEvent::CallProgress { status_code, reason, has_sdp, .. } => {
@@ -481,6 +539,11 @@ struct IncomingCall {
     events: tokio::sync::mpsc::Sender<SipEvent>,
     current_call: Arc<std::sync::Mutex<Option<EndpointCall>>>,
     call_active: Arc<AtomicBool>,
+    /// The sound card, so the bridge can be released again when the call ends.
+    call_audio: Arc<callaudio::CallAudio>,
+    /// Set as soon as the bridge is up, so a later go-ahead from the phone
+    /// cannot start a second one.
+    call_audio_started: Arc<AtomicBool>,
     audio_device: &'static str,
     verbose: bool,
 }
@@ -492,6 +555,8 @@ impl IncomingCall {
             events,
             current_call,
             call_active,
+            call_audio,
+            call_audio_started,
             audio_device,
             verbose,
         } = self;
@@ -519,7 +584,11 @@ impl IncomingCall {
                     // handle, so it needs no rebuilding the way an outgoing one does.
                     *current_call.lock().unwrap_or_else(|e| e.into_inner()) = Some(call.clone());
                     call_active.store(true, Ordering::SeqCst);
-                    crate::callaudio::start(call, audio_device, verbose);
+                    // Unlike the outgoing path the bridge can start right here:
+                    // the phone stopped the earpiece before it let us answer, so
+                    // the card is already free.
+                    call_audio_started.store(true, Ordering::SeqCst);
+                    callaudio::start(call, audio_device, verbose, call_audio);
                 }
                 Err(e) => {
                     println!("SIP: Annahme fehlgeschlagen: {}", explain(&e));
@@ -537,10 +606,16 @@ impl IncomingCall {
 /// Pump audio frames between the SIP stack and the sound card.
 ///
 /// Shared by the answer path and the outgoing path so both behave identically.
+///
+/// `card` gets the bridge released when the stream ends. That is the backstop:
+/// the end of a call normally arrives as an event, and [`SipClient::forget_call`]
+/// releases the card before the phone hears about it. This covers the calls
+/// that end without such an event.
 pub async fn pump_audio(
     sender: rvoip::sip::EndpointAudioSender,
     mut receiver: rvoip::sip::EndpointAudioReceiver,
     bridge: Arc<dyn AudioBridge>,
+    card: Arc<callaudio::CallAudio>,
     verbose: bool,
 ) {
     let rate = bridge.sample_rate();
@@ -578,6 +653,12 @@ pub async fn pump_audio(
         println!("SIP: Audio-Übertragung beendet.");
     }
     sender_task.abort();
+
+    // The call is over, so the card has to be free again before the phone plays
+    // anything else in the earpiece. Waiting for it here rather than on the
+    // last drop of the bridge keeps that promise: the sender task still holds a
+    // reference for a moment after the abort.
+    card.release();
 }
 
 #[cfg(test)]

@@ -15,7 +15,7 @@ Here the SIP stack is the in-process [`rvoip`](https://crates.io/crates/rvoip-si
 
 # Software
 
-- This project runs on Raspberry Pi OS
+- This project always runs on Raspberry Pi OS (Linux). No macOS/Windows version.
 - Outgoing/incoming calls (SIP) are performed via `rvoip`
 
 # Features
@@ -37,9 +37,10 @@ A sample feature-complete configuration file is provided in `support/config-exam
 
 # Rules
 
-- Never compile on macOS or Windows machines.
-- Access to a real Raspberry Pi Zero 2W with wired-up hardware can be provided for testing.
-- Access to another Raspberry Pi 5 with 4GB of RAM can be provided for compiling.
+- Read AGENTS.override.md, if it exists.
+- Never compile or test on macOS or Windows machines, except for End-to-End-Tests of the Webserver.
+- Access to a Raspberry Pi Zero 2W with wired-up hardware can be provided for testing.
+- Access to a Raspberry Pi 5 with 4GB of RAM can be provided for compiling.
 - Always ask before installing system-wide applications (e.g. via `apt`).
 - Always ask before changing system-wide settings (e.g. systemd services).
 
@@ -50,7 +51,7 @@ A sample feature-complete configuration file is provided in `support/config-exam
 | `src/phone.rs` | The state machine: dial, hook switch, features, watchdog |
 | `src/sip.rs` | `rvoip` endpoint wrapper, event loop, call decisions |
 | `src/callaudio.rs` | ALSA bridge between the SIP stack and the USB sound card |
-| `src/audio.rs` | Sound playback on the `i2s` amplifier (ringtones, tests, sleep music) |
+| `src/audio.rs` | Sound playback: symphonia decoding plus ALSA, for the `i2s` amplifier and the `usb` earpiece; the call-progress tones are generated in memory |
 | `src/gpio.rs` | Pulse decoding, watcher thread, LEDs with software PWM |
 | `src/gpio/linux.rs` | `gpiod` backend, the only hardware-touching module |
 | `src/config.rs` | Schema, validation, reading and writing the TOML file |
@@ -90,6 +91,11 @@ Each opens the pins it needs, so run them one at a time:
 - `cargo run --example hardware-audio` — ringtones, loudspeaker and earpiece test, opens the call bridge
 - `cargo run --example gpio-probe` — reads raw pin levels, for diagnosing wiring
 - `cargo run --example audio-probe -- <device> <rate> <channels>` — tries ALSA parameter combinations
+- `cargo run --example decode-probe -- sounds` — decodes every file in `sounds/`, no sound card needed
+- `cargo run --example playback-probe -- sounds` — plays WAV and MP3 on both devices and the generated tones in
+  the earpiece, checks the repeat loop and an early stop, and verifies each sound lasts as long as the file says
+  (`playback-probe -- sounds tones` leaves out the files and only plays the tones, which is quiet enough to repeat
+  on a phone that is in service)
 
 # Web interface
 
@@ -124,6 +130,19 @@ written by hand in the file are not preserved.
   use the plain `usb` alias instead, which already matches the stereo files in `sounds/`. ALSA will not
   share a USB device between two open streams, so the bridge is opened **per call**, never at startup;
   holding it open would silence the dial tone and the earpiece test.
+- **The call bridge has to hand the card back, and wait for it.** `UsbBridge`'s two ALSA threads loop
+  until `active` goes false, and the streams live inside those threads: nothing else can close them. So
+  clearing the flag and returning is not enough - the next dial tone would still find `plug:usb` busy and
+  stay silent, and a second call would silently fall back to a bridge without audio. `UsbBridge::stop`
+  clears the flag *and* joins both threads before it returns, `Drop` calls it as well, and `CallAudio`
+  keeps the bridge of the running call so `SipClient::forget_call` can hand the card back.
+- **Order matters when the card changes hands, and both directions have bitten.** The busy tone after a
+  call plays on the card the conversation just held, so `forget_call` releases it *before* the end event
+  goes to the phone; the ringback tone is still playing when a call we placed gets answered, so the phone
+  stops it and only then sends `SipCommand::StartCallAudio` - an answered incoming call skips that wait
+  because the phone freed the earpiece before it answered. Neither is a lock: both are "make sure the
+  other one is finished first", and getting either backwards costs a silent earpiece or a silent call.
+  `playback-probe -- sounds tones` walks both handovers on the real card.
 - **The SIP endpoint** binds to all interfaces but advertises the address the OS would use to reach the
   registrar, because SDP has to carry a routable address.
 - **Registering** has to happen *after* the event stream exists, or the `RegistrationChanged` event is
@@ -149,10 +168,34 @@ written by hand in the file are not preserved.
   no reactor running" — and only as soon as somebody dials that feature, so it never shows up in
   testing. Always go through `self.runtime`. A unit test asserts this textually, because the panic
   cannot be provoked without the hardware.
-- **`Channel::wait()` must leave the child in its slot.** Taking it out first makes the waiting
-  thread the only owner, and a later `stop()` then finds nothing to kill — the sleep music runs to
-  the end of its track however often it is asked to stop. It polls `try_wait()` instead, releasing
-  the lock between checks so `stop` can still reach the child.
+- **`Channel::wait()` waits on the playback thread, not on a child process.** Playback is in-process:
+  symphonia decodes, ALSA writes, one thread per sound. `wait()` blocks on a condvar that the thread
+  signals when it is done, and `stop()` sets a flag and then waits for the same signal, so the sound
+  card is free again before the caller can start the next sound. The thread must call `finish()` on
+  every exit path, or `stop()` would block forever.
+- **Playback must drain before reporting the sound over.** ALSA buffers whatever is written, so the
+  decode loop finishes long before the card has played it. Without draining, `wait()` returns while
+  the last fraction of a second is still audible, and a confirmation tone sounds cut off. The drain
+  polls `avail()` against the buffer size in short slices, so a stop request still cuts it short.
+- **The sample rate is requested with `ValueOr::Less`, never `Nearest`.** The C-Media USB codec in
+  the earpiece rejects an approximate rate: with `Nearest` the stream reaches `Prepared` and then
+  `snd_pcm_start` fails with a broken pipe, while `aplay` on the same card works. `Less` makes ALSA
+  commit to the rate the hardware actually runs (44100 comes back as 44099) and `plug:` covers the
+  rest. This is not cosmetic — it is the difference between a working earpiece and no sound at all.
+- **symphonia needs the `pcm` feature for WAV.** The `wav` feature only registers the reader; without
+  `pcm` there is no decoder for plain PCM and every WAV file fails with "unsupported audio codec".
+  The MP3 files are bare ADTS streams with ID3v2 tags, which is why `mp3` and `id3v2` are both on.
+- **The call-progress tones are generated, not decoded.** `Tone` in `src/audio.rs` holds the sequences as
+  frequency/duration steps and renders them to PCM in memory: Freizeichen is a steady 425 Hz, Besetzt 425 Hz
+  for half a second then half a second of silence, Freiton a second of 425 Hz then four of silence, and so on.
+  They are not configurable, because there is nothing to configure - a file would have to be decoded to arrive
+  at the sine that the table already describes. Two details matter and are easy to break: the endless step is
+  one second long and repeated by the playback loop, which only works because every frequency completes a whole
+  number of cycles per second, and the loop checks the stop flag between short slices, so lifting the handset
+  does not wait out a whole pass.
+- **The earpiece is a single channel shared by everything the phone says.** The call audio opens it too, so the
+  tones have to give way: the ringback stops in `CallAnswered` before the bridge grabs the card, and
+  `play_earpiece_tone` silences the loudspeaker so the sleep music cannot play underneath a dial tone.
 - **A call that is still ringing has no answered handle.** `current_call` is only set once a call is
   answered, so hanging up during setup used to do nothing and left the other end ringing. Hangup
   falls back to the outgoing `CallId`, which rvoip turns into a proper CANCEL.

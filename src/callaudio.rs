@@ -38,14 +38,18 @@ const QUEUE_DEPTH: usize = 25;
 /// Spin up the audio pumps for one call.
 ///
 /// Both directions run for as long as the call lasts; the tasks end when the
-/// call's audio stream closes.
+/// call's audio stream closes, and the card is released with them.
 ///
 /// The sound card is opened here rather than at startup on purpose. It is the
 /// same card the earpiece tones play on, and ALSA will not share a USB device
 /// between two open streams, so holding it for the life of the process would
 /// silence the dial tone and the earpiece test. Opening per call means the card
-/// is free whenever no conversation is up.
-pub fn start(call: rvoip::sip::EndpointCall, device: &str, verbose: bool) {
+/// is free whenever no conversation is up - which only holds if the bridge
+/// really lets go of it again, see [`alsa::UsbBridge::stop`].
+///
+/// `card` is how the bridge announces that it holds the card, so whoever ends
+/// the call can take it away again. See [`CallAudio`].
+pub fn start(call: rvoip::sip::EndpointCall, device: &str, verbose: bool, card: Arc<CallAudio>) {
     let device = device.to_string();
 
     // Everything happens off the SIP event loop. `audio()` has to claim the
@@ -70,9 +74,54 @@ pub fn start(call: rvoip::sip::EndpointCall, device: &str, verbose: bool) {
             }
         };
 
+        // The card is taken before the first frame moves, so the SIP loop can
+        // hand it back the moment the call is over.
+        card.hold(bridge.clone());
+
         let (sender, receiver) = audio.split();
-        crate::sip::pump_audio(sender, receiver, bridge, verbose).await;
+        crate::sip::pump_audio(sender, receiver, bridge, card, verbose).await;
     });
+}
+
+/// Who is holding the call sound card.
+///
+/// The card can only ever belong to one thing: ALSA refuses to share a USB
+/// device, so a conversation and an earpiece tone cannot both have it. That
+/// makes the end of a call the interesting moment - the phone reacts to it by
+/// playing the busy tone, on the card the conversation was using a moment ago.
+///
+/// So the bridge registers itself here, and the SIP loop releases the card
+/// *before* it reports the end of the call. Letting the phone hear about the
+/// end first would lose the race: the busy tone it wants to play would look for
+/// a card that the conversation is still holding while it shuts down, find it
+/// busy, and stay silent.
+#[derive(Default)]
+pub struct CallAudio {
+    bridge: Mutex<Option<Arc<dyn AudioBridge>>>,
+}
+
+impl CallAudio {
+    /// Give the card back and wait until it really is free.
+    ///
+    /// Cheap when nobody holds it, so it can be called on every end of a call.
+    pub fn release(&self) {
+        let bridge = self.bridge.lock().unwrap_or_else(|e| e.into_inner()).take();
+        // Outside the lock: stopping a bridge waits for its ALSA threads.
+        if let Some(bridge) = bridge {
+            bridge.stop();
+        }
+    }
+
+    /// Register the bridge of the call that is up, which is to say: the card is
+    /// taken from here on.
+    pub fn hold(&self, bridge: Arc<dyn AudioBridge>) {
+        let previous = self
+            .bridge
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(bridge);
+        drop(previous);
+    }
 }
 
 /// A bridge that drops all audio.
@@ -123,7 +172,7 @@ impl RingBuffer {
 pub mod alsa {
     use super::{RingBuffer, RATE, FRAME};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -136,6 +185,11 @@ pub mod alsa {
         /// Samples captured from the microphone waiting to be sent.
         capture: Arc<RingBuffer>,
         active: Arc<AtomicBool>,
+        /// The two ALSA threads, kept so they can be waited for.
+        ///
+        /// The card is only really free once they have returned and dropped
+        /// their handles, which is why [`UsbBridge::stop`] joins them.
+        threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     }
 
     impl UsbBridge {
@@ -151,14 +205,22 @@ pub mod alsa {
             configure(&capture_pcm)?;
             capture_pcm.start().map_err(|e| format!("Aufnahme nicht startbar: {}", e))?;
 
-            let bridge = UsbBridge {
+            let mut bridge = UsbBridge {
                 playback: Arc::new(RingBuffer::new()),
                 capture: Arc::new(RingBuffer::new()),
                 active: Arc::new(AtomicBool::new(true)),
+                threads: Mutex::new(Vec::new()),
             };
 
-            bridge.spawn_playback(playback_pcm)?;
-            bridge.spawn_capture(capture_pcm)?;
+            // If the second stream cannot be opened, the local bridge is dropped
+            // on the way out, which stops and joins the thread that already owns
+            // the first one and hands the card back.
+            if let Err(e) = bridge.spawn_playback(playback_pcm) {
+                return Err(e);
+            }
+            if let Err(e) = bridge.spawn_capture(capture_pcm) {
+                return Err(e);
+            }
 
             Ok(bridge)
         }
@@ -177,12 +239,28 @@ pub mod alsa {
             }
         }
 
+        /// Let go of the card and wait until it really is free.
+        ///
+        /// This is what makes the phone usable again after a call: the dial tone
+        /// and the other earpiece sounds open the very same card, and ALSA will
+        /// not share it, so a bridge that merely stopped writing silence would
+        /// still hold the device and every later tone would stay silent.
+        ///
+        /// Idempotent, and safe to call from [`Drop`].
+        pub fn stop(&self) {
+            self.active.store(false, Ordering::SeqCst);
+            for thread in self.threads.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+                // The threads own the streams and close them on their way out.
+                let _ = thread.join();
+            }
+        }
+
         /// Write queued samples to the earpiece until the call ends.
-        fn spawn_playback(&self, pcm: alsa::pcm::PCM) -> Result<(), String> {
+        fn spawn_playback(&mut self, pcm: alsa::pcm::PCM) -> Result<(), String> {
             let queue = self.playback.clone();
             let active = self.active.clone();
 
-            thread::Builder::new()
+            let handle = thread::Builder::new()
                 .name("alsa-playback".to_string())
                 .spawn(move || {
                     let io = match pcm.io_i16() {
@@ -207,15 +285,16 @@ pub mod alsa {
                 })
                 .map_err(|e| format!("Wiedergabe-Thread nicht startbar: {}", e))?;
 
+            self.remember_thread(handle);
             Ok(())
         }
 
         /// Read microphone frames into the capture buffer for the SIP pump.
-        fn spawn_capture(&self, pcm: alsa::pcm::PCM) -> Result<(), String> {
+        fn spawn_capture(&mut self, pcm: alsa::pcm::PCM) -> Result<(), String> {
             let queue = self.capture.clone();
             let active = self.active.clone();
 
-            thread::Builder::new()
+            let handle = thread::Builder::new()
                 .name("alsa-capture".to_string())
                 .spawn(move || {
                     let io = match pcm.io_i16() {
@@ -241,7 +320,21 @@ pub mod alsa {
                 })
                 .map_err(|e| format!("Aufnahme-Thread nicht startbar: {}", e))?;
 
+            self.remember_thread(handle);
             Ok(())
+        }
+
+        /// Keep a thread so [`UsbBridge::stop`] can wait for it.
+        fn remember_thread(&self, thread: std::thread::JoinHandle<()>) {
+            self.threads.lock().unwrap_or_else(|e| e.into_inner()).push(thread);
+        }
+    }
+
+    impl Drop for UsbBridge {
+        fn drop(&mut self) {
+            // Whoever holds the bridge last releases the card, so a bridge that
+            // is dropped without a `stop` still does not strand the device.
+            self.stop();
         }
     }
 
@@ -254,6 +347,12 @@ pub mod alsa {
         /// Samples from the microphone, for the next RTP frame.
         fn take_speaker(&self) -> Option<Vec<i16>> {
             self.capture.pop()
+        }
+
+        /// Hand the card back, rather than waiting for the last drop: the phone
+        /// plays the dial tone on it as soon as the call is over.
+        fn stop(&self) {
+            UsbBridge::stop(self);
         }
     }
 
@@ -302,6 +401,7 @@ pub fn open_bridge(device: &str) -> Arc<dyn AudioBridge> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn ring_buffer_drops_oldest_when_full() {
@@ -331,6 +431,57 @@ mod tests {
         let bridge = NullBridge;
         bridge.push_microphone(vec![0; FRAME]);
         assert!(bridge.take_speaker().is_none());
+    }
+
+    #[test]
+    fn stopping_a_bridge_holds_nothing() {
+        // The earpiece tones open the same card the bridge holds, so a bridge
+        // that has been stopped must be gone as far as the device is concerned.
+        // Without a sound card there is nothing to release, but every path into
+        // that code has to at least run: `stop` twice, like the call end and the
+        // final drop would.
+        let bridge = open_bridge("this-device-does-not-exist");
+        bridge.stop();
+        bridge.stop();
+        drop(bridge);
+    }
+
+    /// A bridge that only counts how often it was stopped.
+    struct CountingBridge(Arc<AtomicUsize>);
+
+    impl AudioBridge for CountingBridge {
+        fn push_microphone(&self, _samples: Vec<i16>) {}
+        fn take_speaker(&self) -> Option<Vec<i16>> {
+            None
+        }
+        fn stop(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn releasing_the_card_stops_the_bridge_of_the_call() {
+        // The phone answers the end of a call by playing the busy tone, on the
+        // card the conversation had. If the card were still held at that point,
+        // the tone would be refused for being busy - and stay unheard.
+        let card = CallAudio::default();
+        let stops = Arc::new(AtomicUsize::new(0));
+        card.hold(Arc::new(CountingBridge(stops.clone())));
+
+        card.release();
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "die Brücke muss freigegeben werden");
+
+        // Releasing again is what every later end of a call does; it must not
+        // wait on a bridge that is gone.
+        card.release();
+        assert_eq!(stops.load(Ordering::SeqCst), 1, "zweimal freigeben darf nicht doppelt anhalten");
+    }
+
+    #[test]
+    fn releasing_an_untouched_card_does_nothing() {
+        // Every call that was never answered ends this way.
+        let card = CallAudio::default();
+        card.release();
     }
 
     #[test]

@@ -1,10 +1,10 @@
 # FeTAp611-VoIP-Tischtelefon auf Basis eines Raspberry Pi Zero 2 W
 
-Diese Version ist die Rust-Portierung von [https://github.com/fox34/piphone-fetap](piphone-fetap).
-Statt `linphonec` als Unterprozess zu starten, bringt das Programm den SIP-Stack als 
-`rvoip`-Crate mit. Verhalten, Konfiguration und Weboberfläche sind identisch.
+Diese Version ist der Rust-Port von [https://github.com/fox34/piphone-fetap](piphone-fetap).
+Sie enthält einen eigenständigen SIP-Stack (`rvoip`-Crate) und benötigt keine externen Programme.
+Verhalten, Konfiguration und Weboberfläche sind identisch zur Python-Version.
 
-Komponenten:
+## Hardware-Komponenten
 
 - FeTAp 611, nötige Originalkomponenten: Nummernschalter und Gabelkontakt
 - Raspberry Pi Zero 2 W
@@ -18,7 +18,7 @@ Komponenten:
 - Hörer-Lautsprecher, bspw. aus altem Headset
 - Hörer-Mikrofon, bspw. aus altem Headset
 
-# Verkabelung
+## Verkabelung
 
 | Gerät/Funktion | Pin | GPIO | Pi-Pin-Nr. |
 | :--- | :--- | ---: | ---: |
@@ -39,30 +39,17 @@ Optional verbaute LEDs (Nachtlicht, Aufwachlicht) werden über die Optionen `nig
 
 # Linux konfigurieren
 
-## Komponenten installieren
+## Benötigte Komponenten installieren
 
 ```
 sudo apt update ; sudo apt upgrade
-sudo apt install git sox libsox-fmt-mp3 --no-install-recommends
+sudo apt install git alsa-utils --no-install-recommends
 sudo apt autoremove
 ```
 
-Zum Bauen werden zusätzlich benötigt: `build-essential`, `pkg-config`, `libasound2-dev`, `libgpiod-dev`
-und eine Rust-Toolchain (`rustup`).
-
-## Konfigurationsdatei
-
-Die Konfiguration sollte bspw. unter `/boot/piphone/config.toml` abgelegt werden, damit sie auch in einem
-schreibgeschützten Root-Dateisystem (bspw. OverlayFS) angepasst werden kann. Eine vollständig kommentierte Vorlage
-gibt es in `support/config-example.toml`.
-
-```
-sudo mkdir -p /boot/piphone
-sudo cp support/config-example.toml /boot/piphone/config.toml
-sudo vim /boot/piphone/config.toml
-```
-
-Ein anderer Pfad kann über `-c/--config` angegeben werden.
+Medien werden mittels [symphonia](https://crates.io/crates/symphonia) dekodiert und über
+ALSA ausgegeben.
+`alsa-utils` bleibt installiert, weil der Dienst `i2s-silence` unten `aplay` aufruft.
 
 ## MAX98357A aktivieren
 
@@ -166,16 +153,6 @@ ctl.i2s {
 }
 ```
 
-> **Hinweis zum Gesprächsaudio:** Für Gespräche öffnet der Code die USB-Soundkarte als `plug:usb`,
-> nicht als `usb`. Dieser C-Media-Codec kann nur 44,1 oder 48 kHz und nur einen Kanal. G.711 im
-> SIP-Stack arbeitet dagegen mit 8 kHz. Ohne den `plug`-Wrapper lehnt ALSA diese Konfiguration ab.
-> Mit Wrapper übernimmt alsa-lib die Umwandlung, sodass der SIP-Stack bei seinen 8 kHz bleibt.
->
-> Die Signale im Hörer (`waehlen-frei` und die beiden Testtöne) laufen weiterhin über `usb`, weil die
-> Dateien dort bereits im Format der Karte vorliegen. ALSA kann eine USB-Karte nicht an zwei
-> offene Streams gleichzeitig vergeben, deshalb wird die Gesprächsbrücke **pro Anruf** geöffnet und
-> nicht dauerhaft beim Start. Sonst wäre der Freiton stumm.
-
 ## Knacken am MAX98357 bei Start einer Wiedergabe verhindern
 
 Siehe auch: https://github.com/volumio/Volumio2/issues/1973
@@ -212,25 +189,7 @@ alsamixer
 sudo alsactl store
 ```
 
-# Bauen und installieren
-
-Der Pi Zero 2W ist für die Rust-Kompilierung zu klein; `rustc` wird beim `rvoip`-Abhängigkeitsbaum
-vom Kernel gekillt. Daher auf einem stärkeren Linux-Rechner bauen und das Binary übertragen:
-
-```
-cargo build --release
-scp target/release/aarch64-unknown-linux-gnu/release/piphone pi:/opt/piphone/piphone
-```
-
-Anschließend der Dienst aus `support/etc/systemd/system/piphone.service`:
-
-```
-sudo cp support/etc/systemd/system/piphone.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now piphone
-```
-
-# Aufruf
+# Benutzung
 
 ```
 piphone [Optionen]
@@ -239,9 +198,23 @@ piphone [Optionen]
       --ignore-dnd       Nicht stören für Testzwecke deaktivieren
       --no-web           Webserver zur Steuerung nicht starten
       --silent-boot      Keinen Start-Sound abspielen
-  -v, --verbose           Ausführliches Logging aktivieren
-  -h, --help              Diese Hilfe anzeigen
+  -v, --verbose          Ausführliches Logging aktivieren
+  -h, --help             Diese Hilfe anzeigen
 ```
+
+## Konfiguration
+
+Die Konfiguration sollte bspw. unter `/boot/piphone/config.toml` abgelegt werden, damit sie auch in einem
+schreibgeschützten Root-Dateisystem (bspw. OverlayFS) angepasst werden kann. Eine kommentierte Vorlage
+gibt es in `support/config-example.toml`.
+
+```
+sudo mkdir -p /boot/piphone
+sudo cp support/config-example.toml /boot/piphone/config.toml
+sudo vim /boot/piphone/config.toml
+```
+
+Ein anderer Pfad kann über `-c/--config` angegeben werden.
 
 # Bonusfunktionen
 
@@ -262,20 +235,35 @@ Anschließend ist das Telefon im WLAN unter `http://<IP-Adresse-des-Pi>` erreich
 
 ## Nacht- und Aufwachlicht
 
-Es können über die Konfigurationsoptionen im Bereich `[misc]` sowohl eine Nachtlicht- als auch eine Aufwachlicht-LED konfiguriert werden.
+Es können über die Konfigurationsoptionen im Bereich `[misc]` sowohl eine Nachtlicht- als 
+auch eine Aufwachlicht-LED konfiguriert werden.
 Über die Kurzwahl `enable-night-mode` wird dann das Nachtlicht bis zur konfigurierten Uhrzeit aktiviert.
 
 ## Schlafmusik
 
-Über die Kurzwahl `start-sleep-music` wird die Spieluhr aktiviert. Die Spieluhr stoppt, sobald der Hörer abgehoben wird.
+Über die Kurzwahl `start-sleep-music` wird die Spieluhr aktiviert.
+Die Spieluhr stoppt, sobald der Hörer abgehoben wird.
 
-## Hinweise zur GPIO-Anbindung
+# Kompilieren
 
-- Die Pins werden über `gpiod` angesprochen, weil die Verkabelung einen Pull-up braucht.
-- Die Impulse werden im 1-ms-Takt abgefragt statt über Flankenerkennung, damit die Lösung auch mit
-  libgpiod 1.x und 2.x funktioniert.
-- Fehlt `libgpiod-dev`, lässt sich das Projekt auf einem Raspberry Pi OS nicht bauen. Für
-  andere Systemen gibt es eine Ersatzimplementierung, mit der die Tests ohne Hardware laufen.
+Kompilieren muss auf einem Linux-System durchgeführt werden. Der Pi Zero 2W hat zu wenig
+Arbeitsspeicher und der Prozess wäre sehr langsam.
+
+Neben den u.g. Paketen wird auch eine Rust-Toolchain (`rustup`) benötigt.
+
+```
+apt install build-essentials pkg-config libasound2-dev libgpiod-dev
+cargo build --release
+scp target/release/aarch64-unknown-linux-gnu/release/piphone pi:/opt/piphone/piphone
+```
+
+Gestartet wird der Dienst über systemd, siehe `support/etc/systemd/system/piphone.service`:
+
+```
+sudo cp support/etc/systemd/system/piphone.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now piphone
+```
 
 ## Tests
 
@@ -304,3 +292,11 @@ cargo run --example hardware-audio         # Klingeltöne, Lautsprecher, Hörer,
 cargo run --example gpio-probe             # rohe Pin-Pegel, zur Fehlersuche in der Verkabelung
 cargo run --release --example audio-probe -- plug:usb 8000 1   # ALSA-Parameter durchprobieren
 ```
+
+## Hinweise zur GPIO-Anbindung
+
+- Die Pins werden über `gpiod` angesprochen, weil die Verkabelung einen Pull-up braucht.
+- Die Impulse werden im 1-ms-Takt abgefragt statt über Flankenerkennung, damit die Lösung auch mit
+  libgpiod 1.x und 2.x funktioniert.
+- Fehlt `libgpiod-dev`, lässt sich das Projekt auf einem Raspberry Pi OS nicht bauen. Für
+  andere Systemen gibt es eine Ersatzimplementierung, mit der die Tests ohne Hardware laufen.

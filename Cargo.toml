@@ -1,6 +1,6 @@
 [package]
 name = "piphone"
-version = "1.0.0"
+version = "1.1.0"
 authors = ["Steffen Manzer"]
 edition = "2021"
 rust-version = "1.91"
@@ -49,6 +49,18 @@ chrono = { version = "0.4", features = ["clock"] }
 
 # Randomised sleep-music order
 rand = "0.9"
+
+# Decoding the ringtones and tones in `sounds/`. Only the WAV and MP3 features are
+# enabled, because those are the only formats in use. `pcm` is the decoder for
+# plain WAV, and without it every WAV file fails with "unsupported audio codec".
+# `opt-simd-neon` matters: the Pi Zero 2W is an ARM Cortex-A53, which has NEON.
+symphonia = { version = "0.6", default-features = false, features = [
+    "wav",
+    "mp3",
+    "pcm",
+    "id3v2",
+    "opt-simd-neon",
+] }
 
 # HTTP Basic Auth decoding
 base64 = "0.23"

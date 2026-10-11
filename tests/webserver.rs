@@ -306,8 +306,7 @@ fn valid_payload() -> Json_ {
         "ringtones": { "08912345": "/opt/piphone/sounds/ring-02.wav" },
         "sounds": {
             "ring": "/opt/piphone/sounds/ring-01.wav",
-            "sleep_music": ["/opt/a.mp3", "/opt/b.mp3"],
-            "waehlen_frei": "/opt/frei.mp3"
+            "sleep_music": ["/opt/a.mp3", "/opt/b.mp3"]
         },
         "misc": {
             "wake_up_times": ["06:30", "06:30", "06:30", "06:30", "06:30", "07:30", "07:30"]
