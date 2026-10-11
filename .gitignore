@@ -1,3 +1,7 @@
+.DS_Store
+/.ssh
 /target
 /node_modules
 package-lock.json
+AGENTS.override.md
+

@@ -35,6 +35,14 @@ Here the SIP stack is the in-process [`rvoip`](https://crates.io/crates/rvoip-si
 Calling and other features are performed/toggled via short codes, entered with the rotary dial.
 A sample feature-complete configuration file is provided in `support/config-example.toml`.
 
+# Rules
+
+- Never compile on macOS or Windows machines.
+- Access to a real Raspberry Pi Zero 2W with wired-up hardware can be provided for testing.
+- Access to another Raspberry Pi 5 with 4GB of RAM can be provided for compiling.
+- Always ask before installing system-wide applications (e.g. via `apt`).
+- Always ask before changing system-wide settings (e.g. systemd services).
+
 # Layout
 
 | Path | Contents |
