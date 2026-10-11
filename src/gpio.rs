@@ -276,8 +276,6 @@ pub struct PulseDecoder {
     /// Consecutive NSA samples seen so far, in 5 ms ticks.
     nsa_low_count: u32,
     nsa_high_count: u32,
-    /// Was NSA high in the last sample? The dial rests with this contact closed.
-    nsa_high: bool,
     /// Samples since the last NSA tick.
     tick: u32,
 }
@@ -297,7 +295,6 @@ impl PulseDecoder {
             high_pulse: 0,
             nsa_low_count: 0,
             nsa_high_count: 0,
-            nsa_high: true,
             tick: 0,
         }
     }
@@ -306,7 +303,6 @@ impl PulseDecoder {
     /// to rest.
     pub fn step(&mut self, nsi_low: bool, nsa_low: bool) -> Option<u32> {
         let mut digit = None;
-        self.nsa_high = !nsa_low;
 
         // The NSA contact is only looked at every 5 ms.
         self.tick += 1;
@@ -369,8 +365,13 @@ impl PulseDecoder {
     /// debounce, and that happens without any further level change - so this is
     /// what stops the watcher from sleeping through the end of a rotation.
     /// `None` when nothing is pending.
-    pub fn pending_samples(&self) -> Option<u32> {
-        if !self.counting || !self.nsa_high {
+    ///
+    /// `nsa_low` is the contact's level *now*, not the one the last sample saw.
+    /// The two differ right after a change, because no sample has been stepped
+    /// for the new level yet, and asking the decoder here instead would let a
+    /// finished dial sit unread until the next unrelated contact moved.
+    pub fn pending_samples(&self, nsa_low: bool) -> Option<u32> {
+        if !self.counting || nsa_low {
             return None;
         }
 
@@ -558,7 +559,7 @@ impl Watcher {
     /// the decoder has been fed the samples it is waiting for. With neither
     /// pending, only a level change can wake it.
     fn wake_after(&self) -> Duration {
-        let dial = match self.decoder.pending_samples() {
+        let dial = match self.decoder.pending_samples(self.nsa_low) {
             Some(samples) => DIAL_SAMPLE * samples,
             None => IDLE_WAIT,
         };
@@ -669,7 +670,24 @@ mod tests {
             decoder.step(true, false);
         }
 
-        assert_eq!(decoder.pending_samples(), None);
+        assert_eq!(decoder.pending_samples(false), None);
+    }
+
+    #[test]
+    fn a_finished_dial_is_owed_before_the_next_sample() {
+        let mut decoder = PulseDecoder::new();
+        let settle = NSA_TICK_SAMPLES * (NSA_DEBOUNCE + 5);
+
+        // Turn far enough that the impulse counter runs.
+        for _ in 0..settle {
+            decoder.step(false, true);
+        }
+        assert_eq!(decoder.pending_samples(true), None, "dial still turning");
+
+        // The dial is back at rest, but no sample has been stepped for that new
+        // level yet. Asking the decoder whether NSA is high here is exactly the
+        // mistake that left a finished digit unread until the hook moved.
+        assert!(decoder.pending_samples(false).is_some(), "digit is owed right away");
     }
 
     #[test]
@@ -681,23 +699,23 @@ mod tests {
         for _ in 0..settle {
             assert_eq!(decoder.step(false, true), None);
         }
-        assert_eq!(decoder.pending_samples(), None);
+        assert_eq!(decoder.pending_samples(true), None);
 
         // Back at rest, the digit is owed until the NSA debounce has run out.
         let mut digit = decoder.step(false, false);
-        let mut owed = decoder.pending_samples().expect("dial at rest owes a digit");
+        let mut owed = decoder.pending_samples(false).expect("dial at rest owes a digit");
         assert!(owed > 0);
 
         for _ in 0..settle {
             digit = decoder.step(false, false).or(digit);
 
-            let Some(left) = decoder.pending_samples() else { break };
+            let Some(left) = decoder.pending_samples(false) else { break };
             assert!(left <= owed, "the debt never grows");
             owed = left;
         }
 
         assert_eq!(digit, Some(0), "a rotation without impulses is a 0");
-        assert_eq!(decoder.pending_samples(), None, "nothing owed once reported");
+        assert_eq!(decoder.pending_samples(false), None, "nothing owed once reported");
     }
 
     #[test]
