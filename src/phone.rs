@@ -978,7 +978,15 @@ fn section_mut<'a>(config: &'a mut Table, name: &str) -> Option<&'a mut BTreeMap
 }
 
 /// Next wake-up time: today if it is still ahead, otherwise tomorrow.
+///
+/// `times` holds one entry per weekday, Monday first. A week that is not
+/// complete is no schedule at all: without all seven days there is no next
+/// wake-up to report, whatever day of the week it happens to be.
 fn next_wake_up(times: &[String]) -> Option<chrono::NaiveDateTime> {
+    if times.len() != 7 {
+        return None;
+    }
+
     let now = Local::now();
     let today = now.date_naive();
 
@@ -1114,7 +1122,13 @@ mod tests {
 
     #[test]
     fn rejects_incomplete_week() {
-        assert!(next_wake_up(&["06:30".to_string()]).is_none());
+        // Every length used to be accepted on most days, because only today
+        // and tomorrow were looked up: on a Sunday the Monday entry was still
+        // in a one-element week and hid the missing weekdays.
+        for len in [0, 1, 6, 8] {
+            let times: Vec<String> = std::iter::repeat("06:30".to_string()).take(len).collect();
+            assert!(next_wake_up(&times).is_none(), "{} Einträge sind keine Woche", len);
+        }
     }
 
     #[test]
