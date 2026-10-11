@@ -5,7 +5,7 @@
 //!
 //!     cargo run --example gpio-probe
 
-use gpiod::{AsValues, AsValuesMut, Bias, Chip, Masked, Options};
+use gpiod::{AsValues, AsValuesMut, Bias, Chip, EdgeDetect, Masked, Options};
 
 fn main() {
     let path = "/dev/gpiochip0";
@@ -75,6 +75,52 @@ fn main() {
             }
         }
         Err(e) => println!("Ausgabe: FEHLER {}", e),
+    }
+
+    // 4. Edge detection, which is how the phone reads the contacts.
+    println!("\n=== Flanken auf Pin {} (2 s) ===", pin);
+    let lines = match chip.request_lines(
+        Options::input(&[pin])
+            .bias(Bias::PullUp)
+            .edge(EdgeDetect::Both)
+            .consumer("probe-edge"),
+    ) {
+        Ok(lines) => {
+            println!("Anforderung mit Flankenerkennung: ok");
+            lines
+        }
+        Err(e) => {
+            println!("Anforderung mit Flankenerkennung: FEHLER {}", e);
+            println!("Ohne Flanken liest der Wählscheiben-Thread nichts.");
+            return;
+        }
+    };
+
+    println!("Kontakt kurz schließen und wieder öffnen, sonst passiert hier nichts.");
+    let (sender, changes) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = lines;
+        while let Ok(event) = lines.read_event() {
+            if sender.send(event).is_err() {
+                return;
+            }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut seen = 0;
+    while std::time::Instant::now() < deadline {
+        match changes.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(event) => {
+                seen += 1;
+                println!("  Flanke #{}: {}", seen, event);
+            }
+            Err(_) => break,
+        }
+    }
+
+    if seen == 0 {
+        println!("  keine Flanke gesehen - Verkabelung oder Flankenerkennung prüfen.");
     }
 }
 

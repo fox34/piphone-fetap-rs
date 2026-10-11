@@ -38,11 +38,14 @@ A sample feature-complete configuration file is provided in `support/config-exam
 # Rules
 
 - Read AGENTS.override.md, if it exists.
+- Always ask before installing system-wide applications (e.g. via `apt`).
+- Always ask before changing system-wide settings (e.g. systemd services).
+
+# Building
+
 - Never compile or test on macOS or Windows machines, except for End-to-End-Tests of the Webserver.
 - Access to a Raspberry Pi Zero 2W with wired-up hardware can be provided for testing.
 - Access to a Raspberry Pi 5 with 4GB of RAM can be provided for compiling.
-- Always ask before installing system-wide applications (e.g. via `apt`).
-- Always ask before changing system-wide settings (e.g. systemd services).
 
 # Layout
 
@@ -89,7 +92,7 @@ Each opens the pins it needs, so run them one at a time:
 - `cargo run --example hardware-connections` — live state of dial, impulse contact and hook switch
 - `cargo run --example hardware-dial` — decodes dialled digits
 - `cargo run --example hardware-audio` — ringtones, loudspeaker and earpiece test, opens the call bridge
-- `cargo run --example gpio-probe` — reads raw pin levels, for diagnosing wiring
+- `cargo run --example gpio-probe` — reads raw pin levels and watches for edges, for diagnosing wiring
 - `cargo run --example audio-probe -- <device> <rate> <channels>` — tries ALSA parameter combinations
 - `cargo run --example decode-probe -- sounds` — decodes every file in `sounds/`, no sound card needed
 - `cargo run --example playback-probe -- sounds` — plays WAV and MP3 on both devices and the generated tones in
@@ -123,8 +126,9 @@ written by hand in the file are not preserved.
 # Platform notes
 
 - **GPIO** uses `gpiod`, because the wiring needs pull-up bias, which `gpio-cdev` does not support.
-- **Pulse detection** polls at 1 ms instead of using edge detection: libgpiod's `read_event` is
-  `todo!()` without the `v2` feature, and polling also works across libgpiod 1.x and 2.x.
+- **libgpiod 2.x is a hard requirement** (`gpiod` crate feature `v2`, which links the 2.x ABI).
+- **The contacts are read as edges, not polled.** All three lines are claimed in one `Chip::request_lines` call with `EdgeDetect::Both`, and a dedicated thread blocks in `Lines::read_event`. `Watcher` rebuilds the 1 ms grid `PulseDecoder` was written for from the kernel timestamps on the events, which is what keeps a dial rotation decodable while a callback is busy.
+- **The reader thread cannot be shut down.** `Lines` owns the file descriptor, `read_event` blocks in the kernel and the crate does not expose the descriptor, so there is no way to interrupt it. `Watcher` and the phone live for the whole process anyway; a `Drop` would leave one thread parked, which is why there is no `Drop`.
 - **Call audio** opens the USB card as `plug:usb`. That codec only runs at 44.1 or 48 kHz with a single
   channel; without the `plug` wrapper ALSA rejects the 8 kHz that G.711 requires. The earpiece tones
   use the plain `usb` alias instead, which already matches the stereo files in `sounds/`. ALSA will not

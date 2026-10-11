@@ -467,7 +467,6 @@ pub static SECTIONS: LazyLock<Vec<SectionSpec>> = LazyLock::new(|| {
                     .items("Ein Pfad je Zeile")
                     .comment(&[
                         "Einschlafmusik: mehrere Dateien werden in zufälliger Reihenfolge abgespielt.",
-                        "Beispieldatei aus urheberrechtlichen Gründen nicht im Repository.",
                     ]),
             ],
         ),

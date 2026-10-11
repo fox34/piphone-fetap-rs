@@ -2,7 +2,10 @@
 //!
 //! The hardware layer is split in two: the timing and decoding rules below are
 //! pure logic and therefore testable anywhere, while opening the actual pins is
-//! delegated to a platform backend ([`linux`] on Raspberry Pi OS).
+//! delegated to a platform backend ([`linux`] on Raspberry Pi OS). That backend
+//! reports level changes rather than levels, so [`Watcher`] has to rebuild the
+//! 1 ms sample grid the decoder was written against from the kernel's own
+//! timestamps.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,11 +25,27 @@ pub use backend::Gpio;
 /// Debounce time for the hook switch, matching `bouncetime=100` in the Python version.
 pub const HOOK_DEBOUNCE: Duration = Duration::from_millis(100);
 
-/// Interval at which the hook contact is sampled.
-const HOOK_SAMPLE: Duration = Duration::from_millis(5);
-
 /// Interval at which the dial is sampled, matching `SAMPLE_RATE` in the original.
 const DIAL_SAMPLE: Duration = Duration::from_millis(1);
+
+/// How long the watcher waits when nothing is settling. Only a level change or
+/// an owed decoder sample can wake it, so this is just a safety net, not a
+/// sampling rate.
+const IDLE_WAIT: Duration = Duration::from_secs(3600);
+
+/// Upper bound on the samples a single wake-up feeds. A callback that blocked
+/// for longer than this has already lost the dial state, and the decoder must
+/// not turn that into minutes of busy work.
+const MAX_SAMPLES: u32 = 10_000;
+
+/// Position of the impulse contact inside the single line request.
+const NSI: usize = 0;
+
+/// Position of the normally-closed contact inside the single line request.
+const NSA: usize = 1;
+
+/// Position of the hook switch inside the single line request.
+const HOOK: usize = 2;
 
 /// Number of dial samples per NSA debounce tick. The original watches NSA every
 /// 5 ms while counting impulses every millisecond.
@@ -257,6 +276,8 @@ pub struct PulseDecoder {
     /// Consecutive NSA samples seen so far, in 5 ms ticks.
     nsa_low_count: u32,
     nsa_high_count: u32,
+    /// Was NSA high in the last sample? The dial rests with this contact closed.
+    nsa_high: bool,
     /// Samples since the last NSA tick.
     tick: u32,
 }
@@ -276,6 +297,7 @@ impl PulseDecoder {
             high_pulse: 0,
             nsa_low_count: 0,
             nsa_high_count: 0,
+            nsa_high: true,
             tick: 0,
         }
     }
@@ -284,6 +306,7 @@ impl PulseDecoder {
     /// to rest.
     pub fn step(&mut self, nsi_low: bool, nsa_low: bool) -> Option<u32> {
         let mut digit = None;
+        self.nsa_high = !nsa_low;
 
         // The NSA contact is only looked at every 5 ms.
         self.tick += 1;
@@ -338,17 +361,59 @@ impl PulseDecoder {
 
         digit
     }
+
+    /// Samples still needed before a digit can be reported, assuming the
+    /// contacts keep the levels they have now.
+    ///
+    /// A digit is only finished once NSA has read high for longer than the
+    /// debounce, and that happens without any further level change - so this is
+    /// what stops the watcher from sleeping through the end of a rotation.
+    /// `None` when nothing is pending.
+    pub fn pending_samples(&self) -> Option<u32> {
+        if !self.counting || !self.nsa_high {
+            return None;
+        }
+
+        let ticks = (NSA_DEBOUNCE + 1).saturating_sub(self.nsa_high_count);
+        Some(ticks.max(1) * NSA_TICK_SAMPLES)
+    }
+}
+
+/// A level change on one of the phone's inputs, as reported by the backend.
+pub struct Change {
+    /// Position of the line inside the request passed to [`Gpio::inputs`].
+    pub index: usize,
+    /// Is the line low after the change, i.e. is the contact closed?
+    pub low: bool,
+    /// When the change happened, on the kernel's monotonic clock. Differences
+    /// between two changes are exact, no matter what the consumer was doing -
+    /// that is the whole point, and the reason this is not an [`Instant`].
+    pub time: Duration,
+    /// When the change was picked up here. A few microseconds behind
+    /// [`Change::time`], and the right clock for waiting out a debounce.
+    pub seen: Instant,
 }
 
 /// Watch the dial and the hook switch until the process ends.
 ///
-/// Both are sampled from one thread: libgpiod's edge events are not available on
-/// every kernel, and a millisecond poll is cheap enough for this purpose.
+/// All three contacts are claimed in one request and read as level changes, so
+/// the thread sleeps until the wiring actually moves instead of asking the chip
+/// a thousand times a second. Each change carries the kernel's own timestamp,
+/// which lets [`PulseDecoder`] keep running on its millisecond grid even when a
+/// callback kept the thread busy for a while.
 pub struct Watcher {
-    nsi: backend::Input,
-    nsa: backend::Input,
-    hook: backend::Input,
+    contacts: backend::Inputs,
     decoder: PulseDecoder,
+    /// Impulse contact level, as of the last change that was applied.
+    nsi_low: bool,
+    /// Normally-closed contact level, as of the last change that was applied.
+    nsa_low: bool,
+    /// Kernel time the decoder grid was last advanced to.
+    applied: Option<Duration>,
+    /// When that kernel time was, on this machine's clock.
+    last_seen: Instant,
+    /// Elapsed time too short to be a whole sample yet.
+    carry: Duration,
     /// Last reported hook state (`true` = handset on the cradle).
     hooked: bool,
     /// State the hook is currently settling towards.
@@ -359,16 +424,22 @@ pub struct Watcher {
 
 impl Watcher {
     pub fn new(gpio: &Gpio, nsi: u32, nsa: u32, hook: u32) -> Result<Self, String> {
-        let nsi = gpio.input(nsi)?;
-        let nsa = gpio.input(nsa)?;
-        let hook_input = gpio.input(hook)?;
+        let contacts = gpio.inputs(&[nsi, nsa, hook])?;
 
-        let hooked = !hook_input.is_low();
+        let nsi_low = contacts.is_low(NSI);
+        let nsa_low = contacts.is_low(NSA);
+        let hooked = !contacts.is_low(HOOK);
+
         Ok(Watcher {
-            nsi,
-            nsa,
-            hook: hook_input,
+            contacts,
             decoder: PulseDecoder::new(),
+            nsi_low,
+            nsa_low,
+            // The levels before the first change are not observable, and the
+            // dial is idle at startup, so the grid starts with the first edge.
+            applied: None,
+            last_seen: Instant::now(),
+            carry: Duration::ZERO,
             hooked,
             pending: hooked,
             since: Instant::now(),
@@ -385,59 +456,145 @@ impl Watcher {
     /// Exposed for the wiring test; the phone itself only uses the decoded
     /// digits from [`Watcher::run`].
     pub fn nsi_is_low(&self) -> bool {
-        self.nsi.is_low()
+        self.contacts.is_low(NSI)
     }
 
     /// Is the normally-closed contact (NSA) closed, i.e. is the dial turned?
     pub fn nsa_is_low(&self) -> bool {
-        self.nsa.is_low()
+        self.contacts.is_low(NSA)
     }
 
-    /// Sample the contacts, reporting every digit and every hook change.
+    /// Watch the contacts, reporting every digit and every hook change.
     ///
     /// Must not be called from more than one thread.
     pub fn run(&mut self, on_digit: &mut dyn FnMut(u32), on_hook: &mut dyn FnMut(bool)) -> ! {
+        let mut digits = Vec::new();
+
         loop {
-            // The dial is the time-critical input, so it sets the pace.
-            if let Some(digit) = self.decoder.step(self.nsi.is_low(), self.nsa.is_low()) {
+            for change in self.contacts.wait(self.wake_after()) {
+                self.apply(change, &mut digits);
+            }
+
+            // No change this time, but the decoder may still owe a digit: the
+            // dial reached the end of its travel without a further level change.
+            self.advance(self.now(), &mut digits);
+
+            // Reporting after the batch, so a callback that takes its time
+            // cannot push further changes out of the decoder's own timeline.
+            for digit in digits.drain(..) {
                 on_digit(digit);
             }
 
-            self.poll_hook(on_hook);
-
-            thread::sleep(DIAL_SAMPLE);
+            if let Some(hooked) = self.settle() {
+                on_hook(hooked);
+            }
         }
     }
 
-    /// Report a hook change once the contact has been stable long enough.
-    fn poll_hook(&mut self, on_hook: &mut dyn FnMut(bool)) {
-        let level = !self.hook.is_low(); // high = handset on the cradle
+    /// Bring the decoder up to `change`, then take on the new level.
+    fn apply(&mut self, change: Change, digits: &mut Vec<u32>) {
+        // The line held its previous level until this moment, and the decoder
+        // has to see that time before it sees the new level.
+        self.advance(change.time, digits);
 
-        if level != self.pending {
-            // Bouncing: start settling towards the new level again.
-            self.pending = level;
-            self.since = Instant::now();
+        self.last_seen = change.seen;
+
+        match change.index {
+            NSI => self.nsi_low = change.low,
+            NSA => self.nsa_low = change.low,
+            // high = handset on the cradle
+            _ => {
+                let level = !change.low;
+                if level != self.pending {
+                    self.pending = level;
+                    self.since = change.seen;
+                }
+            }
+        }
+    }
+
+    /// Feed the decoder the samples the current levels added up to `until`.
+    ///
+    /// The leftovers stay in `carry`, so the samples stay exactly one
+    /// millisecond apart over a whole dial rotation instead of drifting.
+    fn advance(&mut self, until: Duration, digits: &mut Vec<u32>) {
+        let Some(from) = self.applied else {
+            self.applied = Some(until);
             return;
+        };
+
+        let elapsed = self.carry + until.saturating_sub(from);
+        let samples = (elapsed.as_nanos() / DIAL_SAMPLE.as_nanos()).min(u128::from(MAX_SAMPLES)) as u32;
+        self.carry = elapsed - DIAL_SAMPLE * samples;
+
+        for _ in 0..samples {
+            if let Some(digit) = self.decoder.step(self.nsi_low, self.nsa_low) {
+                digits.push(digit);
+            }
         }
 
-        if level == self.hooked {
-            return; // still the state we already reported
+        self.applied = Some(until);
+    }
+
+    /// The kernel clock, as far as this watcher is concerned: the time of the
+    /// last change, plus however long ago that was. Only the difference from the
+    /// last change is ever used, so the two clocks are never compared across.
+    fn now(&self) -> Duration {
+        self.applied.unwrap_or(Duration::ZERO)
+            + Instant::now().saturating_duration_since(self.last_seen)
+    }
+
+    /// Report the hook change once the contact has been stable long enough.
+    fn settle(&mut self) -> Option<bool> {
+        if self.pending == self.hooked || self.since.elapsed() < HOOK_DEBOUNCE {
+            return None;
         }
 
-        if self.since.elapsed() >= HOOK_DEBOUNCE {
-            self.hooked = level;
-            on_hook(level);
+        self.hooked = self.pending;
+        Some(self.hooked)
+    }
+
+    /// How long this watcher may sleep: until the hook stops bouncing, or until
+    /// the decoder has been fed the samples it is waiting for. With neither
+    /// pending, only a level change can wake it.
+    fn wake_after(&self) -> Duration {
+        let dial = match self.decoder.pending_samples() {
+            Some(samples) => DIAL_SAMPLE * samples,
+            None => IDLE_WAIT,
+        };
+
+        dial.min(self.settle_after())
+    }
+
+    /// How long the next change may take before the hook has to be looked at
+    /// again: until the debounce runs out, or indefinitely while the handset
+    /// stays where it was reported.
+    fn settle_after(&self) -> Duration {
+        if self.pending == self.hooked {
+            return IDLE_WAIT;
         }
+
+        (self.since + HOOK_DEBOUNCE).saturating_duration_since(Instant::now())
     }
 }
 
-/// Poll the hook switch on its own, without the dial.
+/// Watch the hook switch on its own, without the dial.
 ///
 /// Used by the tests and by setups that do not use a rotary dial.
 pub fn watch_hook(watcher: &mut Watcher, on_hook: &mut dyn FnMut(bool)) -> ! {
+    let mut digits = Vec::new();
+
     loop {
-        watcher.poll_hook(on_hook);
-        thread::sleep(HOOK_SAMPLE);
+        for change in watcher.contacts.wait(watcher.wake_after()) {
+            watcher.apply(change, &mut digits);
+        }
+
+        watcher.advance(watcher.now(), &mut digits);
+        digits.clear(); // without a dial there is nothing to decode
+
+        if let Some(hooked) = watcher.settle() {
+            on_hook(hooked);
+        }
     }
 }
 
@@ -502,6 +659,45 @@ mod tests {
         for _ in 0..2000 {
             assert_eq!(decoder.step(true, false), None);
         }
+    }
+
+    #[test]
+    fn an_idle_decoder_owes_nothing() {
+        // This is what lets the watcher sleep until a contact moves.
+        let mut decoder = PulseDecoder::new();
+        for _ in 0..2000 {
+            decoder.step(true, false);
+        }
+
+        assert_eq!(decoder.pending_samples(), None);
+    }
+
+    #[test]
+    fn a_digit_is_owed_until_the_dial_settled() {
+        let mut decoder = PulseDecoder::new();
+        let settle = NSA_TICK_SAMPLES * (NSA_DEBOUNCE + 5);
+
+        // While the dial is turning, nothing is owed: the digit is not complete.
+        for _ in 0..settle {
+            assert_eq!(decoder.step(false, true), None);
+        }
+        assert_eq!(decoder.pending_samples(), None);
+
+        // Back at rest, the digit is owed until the NSA debounce has run out.
+        let mut digit = decoder.step(false, false);
+        let mut owed = decoder.pending_samples().expect("dial at rest owes a digit");
+        assert!(owed > 0);
+
+        for _ in 0..settle {
+            digit = decoder.step(false, false).or(digit);
+
+            let Some(left) = decoder.pending_samples() else { break };
+            assert!(left <= owed, "the debt never grows");
+            owed = left;
+        }
+
+        assert_eq!(digit, Some(0), "a rotation without impulses is a 0");
+        assert_eq!(decoder.pending_samples(), None, "nothing owed once reported");
     }
 
     #[test]

@@ -214,8 +214,8 @@ impl Phone {
         });
 
 
-        // Rotary dial and hook switch share one sampling thread: the dial sets
-        // the pace at 1 ms, which is far more often than the hook needs.
+        // Rotary dial and hook switch share one thread that sleeps until a
+        // contact changes level.
         let dial_phone = phone.clone();
         let hungup_flag = phone.hungup.clone();
         std::thread::Builder::new()

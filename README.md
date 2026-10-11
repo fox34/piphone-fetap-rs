@@ -246,8 +246,8 @@ Die Spieluhr stoppt, sobald der Hörer abgehoben wird.
 
 # Kompilieren
 
-Kompilieren muss auf einem Linux-System durchgeführt werden. Der Pi Zero 2W hat zu wenig
-Arbeitsspeicher und der Prozess wäre sehr langsam.
+Kompilieren muss auf einem Linux-System (z.B. Debian Trixie) durchgeführt werden.
+Der Pi Zero 2W hat zu wenig Arbeitsspeicher und der Prozess wäre sehr langsam.
 
 Neben den u.g. Paketen wird auch eine Rust-Toolchain (`rustup`) benötigt.
 
@@ -280,23 +280,15 @@ npm install jsdom
 node tests/test-webpage.js
 ```
 
-### Hardware-Testwerkzeuge
+### Hardware-Tests
 
 Diese sind nur für die Inbetriebnahme am Telefon gedacht. Jedes öffnet die Pins, die es braucht,
 darum immer einzeln ausführen:
 
 ```
-cargo run --example hardware-connections   # Nummernschalter, Impulskontakt, Hörer live
-cargo run --example hardware-dial          # wählt eine Ziffer und gibt sie aus
-cargo run --example hardware-audio         # Klingeltöne, Lautsprecher, Hörer, Gesprächsbrücke
-cargo run --example gpio-probe             # rohe Pin-Pegel, zur Fehlersuche in der Verkabelung
+cargo run --example hardware-connections   # Nummernschalter, Impulskontakt, Hörer
+cargo run --example hardware-dial          # Gewählte Nummern
+cargo run --example hardware-audio         # Klingeltöne, Lautsprecher, Hörer, Gespräche
+cargo run --example gpio-probe             # GPIO-Debugging (Verkabelung)
 cargo run --release --example audio-probe -- plug:usb 8000 1   # ALSA-Parameter durchprobieren
 ```
-
-## Hinweise zur GPIO-Anbindung
-
-- Die Pins werden über `gpiod` angesprochen, weil die Verkabelung einen Pull-up braucht.
-- Die Impulse werden im 1-ms-Takt abgefragt statt über Flankenerkennung, damit die Lösung auch mit
-  libgpiod 1.x und 2.x funktioniert.
-- Fehlt `libgpiod-dev`, lässt sich das Projekt auf einem Raspberry Pi OS nicht bauen. Für
-  andere Systemen gibt es eine Ersatzimplementierung, mit der die Tests ohne Hardware laufen.
