@@ -328,6 +328,16 @@ impl Phone {
                 std::process::exit(0);
             }
             number => {
+                // Placing a call is the one thing on the dial that needs the
+                // handset in the hand: the commands above are allowed to be
+                // triggered from the cradle (the night light is switched on
+                // before going to bed, with the phone lying unused). Without
+                // this the phone dialled out while it was sitting there.
+                if self.is_hungup() {
+                    println!("Hörer liegt auf der Gabel, {} wird nicht gewählt.", number);
+                    return;
+                }
+
                 if !self.is_connected.load(Ordering::SeqCst) {
                     self.audio.play_earpiece_tone(Tone::Besetzt);
                     return;
