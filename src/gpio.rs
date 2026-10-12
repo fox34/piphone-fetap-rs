@@ -61,8 +61,22 @@ const HIGH_PULSE_DURATION: u32 = 40 / 5;
 /// considered turned, which filters out contact bounce.
 const NSA_DEBOUNCE: u32 = 10;
 
-/// Software PWM frequency in Hz for the LEDs (as in the Python original).
-const PWM_FREQUENCY: f64 = 8000.0;
+/// Software PWM frequency in Hz for the LEDs.
+///
+/// The frequency *is* the CPU cost: every period is two GPIO writes and a timer
+/// wait, so 8 kHz - as in the Python original - woke a thread 8000 times a
+/// second to dim a light that cannot show it. That measured 16% of a core on the
+/// Pi Zero.
+///
+/// It must stay high enough that the LED does not visibly flicker, and that
+/// threshold is higher than the textbook flicker fusion frequency suggests: it
+/// depends on the observer, and on the brightness and viewing angle. A bright
+/// amber light in a dark room is close to the worst case - peripheral vision
+/// resolves flicker far above what foveal vision can. Measured on the real LED,
+/// 200 Hz flickered visibly and 1000 Hz did not; 500 Hz is the next step down
+/// from there, and only the real LED can say whether it is enough. If it ever
+/// flickers again, raise it - the CPU is cheap, the flicker is not.
+const PWM_FREQUENCY: f64 = 500.0;
 
 /// Blink frequency for the status LED during boot.
 const BLINK_FREQUENCY: f64 = 1.0;
@@ -70,6 +84,47 @@ const BLINK_FREQUENCY: f64 = 1.0;
 // -----------------------------------------------------------------------------
 // LEDs
 // -----------------------------------------------------------------------------
+
+/// The two half-periods of a software PWM, or `None` when `duty` sits at an end
+/// of its range and the pin can be driven to a constant level instead.
+///
+/// `frequency` only matters for the blink during boot; the night and wake lights
+/// always run at [`PWM_FREQUENCY`], which is far enough above the flicker fusion
+/// threshold of a bare LED that it cannot show one.
+fn timings(duty: f64, frequency: f64) -> Option<(Duration, Duration)> {
+    let duty = duty.clamp(0.0, 100.0);
+
+    // Both ends of the range are a plain level. Clamping *before* the test is
+    // what puts an out-of-range duty here instead of in a thread that toggles as
+    // fast as it can with one of its two half-periods at zero length.
+    if duty <= 0.0 || duty >= 100.0 {
+        return None;
+    }
+
+    let period = Duration::from_secs_f64(1.0 / frequency.clamp(0.1, PWM_FREQUENCY));
+    let on_time = Duration::from_secs_f64(period.as_secs_f64() * duty / 100.0);
+
+    Some((on_time, period.saturating_sub(on_time)))
+}
+
+/// Sleep until `from + duration`.
+///
+/// `thread::sleep_until` would say this exactly, but it is still unstable
+/// (rust-lang/rust#113752), so the remaining time is computed here instead.
+///
+/// The caller chooses what `from` is, and that choice is what decides what stays
+/// accurate under a late wake-up. A sleep can only end late, never early, so the
+/// overrun has to land somewhere; anchoring the two halves of a cycle to
+/// different points is deliberate - see [`Output::start_pwm`].
+///
+/// A duration already elapsed returns immediately, so the thread never busy-waits
+/// if a write was slow.
+fn sleep_until(from: Instant, duration: Duration) {
+    let remaining = (from + duration).saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        thread::sleep(remaining);
+    }
+}
 
 /// A single output pin, optionally driven by a background software PWM thread.
 pub struct Output {
@@ -92,35 +147,46 @@ impl Output {
 
     /// Drive the pin with a software PWM at `duty` percent.
     ///
-    /// `frequency` only matters for the blink during boot; the night and wake
-    /// lights always run at [`PWM_FREQUENCY`], where the LED cannot show flicker.
+    /// A duty of 0 or 100 - the two ends of the range - needs no thread at all,
+    /// whatever frequency was asked for, because there is nothing to modulate.
     fn start_pwm(&mut self, duty: f64, frequency: f64) {
         self.stop_pwm();
 
-        // Full brightness needs no PWM at all, which avoids the extra thread.
-        if duty >= 100.0 && frequency >= PWM_FREQUENCY {
-            self.set(true);
-            return;
-        }
+        match timings(duty, frequency) {
+            // `timings` clamps, so the only way to get here is a duty at one of
+            // the two ends of its range.
+            None => self.set(duty >= 100.0),
+            Some((on_time, off_time)) => {
+                let stop = self.stop.clone();
+                stop.store(false, Ordering::SeqCst);
 
-        let stop = self.stop.clone();
-        stop.store(false, Ordering::SeqCst);
+                // The output handle is shared with this thread only; `set` takes `&self`.
+                let line = self.line.clone_shared();
+                self.pwm = Some(thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        let cycle = Instant::now();
 
-        let period = Duration::from_secs_f64(1.0 / frequency.clamp(0.1, PWM_FREQUENCY));
-        let duty = duty.clamp(0.0, 100.0);
-        let on_time = Duration::from_secs_f64(period.as_secs_f64() * duty / 100.0);
-        let off_time = period.saturating_sub(on_time);
+                        // The on-pulse is measured from the start of the cycle, so
+                        // the duty - the brightness - is what was asked for even
+                        // if the cycle starts late.
+                        line.set(true);
+                        sleep_until(cycle, on_time);
 
-        // The output handle is shared with this thread only; `set` takes `&self`.
-        let line = self.line.clone_shared();
-        self.pwm = Some(thread::spawn(move || {
-            while !stop.load(Ordering::SeqCst) {
-                line.set(true);
-                thread::sleep(on_time);
-                line.set(false);
-                thread::sleep(off_time);
+                        // The off-time is measured from the *end* of the on-pulse,
+                        // and this is the part that must not be traded away. A
+                        // sleep can only ever end late, so anchoring the gap to
+                        // the cycle would let an overrun eat into it: once the
+                        // overrun is as long as the gap, the gap closes and the
+                        // LED jumps to full brightness until the next cycle. That
+                        // showed up as a visibly varying light level, because how
+                        // much of the gap survived depended on whatever else the
+                        // CPU was doing.
+                        line.set(false);
+                        sleep_until(Instant::now(), off_time);
+                    }
+                }));
             }
-        }));
+        }
     }
 
     fn stop_pwm(&mut self) {
@@ -602,6 +668,65 @@ pub fn watch_hook(watcher: &mut Watcher, on_hook: &mut dyn FnMut(bool)) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The nanoseconds of a duration, as an integer, for comparisons.
+    fn ns(d: Duration) -> i128 {
+        d.as_nanos() as i128
+    }
+
+    #[test]
+    fn the_range_ends_need_no_thread() {
+        assert_eq!(timings(0.0, PWM_FREQUENCY), None);
+        assert_eq!(timings(100.0, PWM_FREQUENCY), None);
+
+        // A duty outside the range is clamped to an end, so it needs no thread
+        // either - it used to produce one with a zero-length half period, which
+        // toggled the pin as fast as it could.
+        assert_eq!(timings(-1.0, PWM_FREQUENCY), None);
+        assert_eq!(timings(150.0, PWM_FREQUENCY), None);
+
+        // The blink is not an exception: at full brightness it is just a steady
+        // light, whatever its frequency.
+        assert_eq!(timings(100.0, BLINK_FREQUENCY), None);
+    }
+
+    #[test]
+    fn the_half_periods_add_up_to_the_period() {
+        for frequency in [BLINK_FREQUENCY, 100.0, PWM_FREQUENCY] {
+            let period = ns(Duration::from_secs_f64(1.0 / frequency));
+            for duty in [1.0, 25.0, 50.0, 75.0, 99.0] {
+                let (on, off) = timings(duty, frequency).expect("duty in range needs a thread");
+
+                assert!(ns(on) > 0, "duty {} at {} Hz has no on time", duty, frequency);
+                assert!(ns(off) > 0, "duty {} at {} Hz has no off time", duty, frequency);
+                assert_eq!(ns(on) + ns(off), period, "duty {} at {} Hz", duty, frequency);
+            }
+        }
+    }
+
+    #[test]
+    fn the_duty_is_the_share_of_the_period_that_is_on() {
+        for duty in [10.0, 33.0, 50.0, 90.0] {
+            let (on, off) = timings(duty, PWM_FREQUENCY).expect("duty in range needs a thread");
+            let total = ns(on) + ns(off);
+
+            // Integer division, so this holds to within one nanosecond.
+            let expected = total / 100 * duty as i128;
+            assert!(
+                (ns(on) - expected).abs() <= 1,
+                "duty {} gave {} ns on out of {} ns",
+                duty,
+                ns(on),
+                total
+            );
+        }
+    }
+
+    #[test]
+    fn an_even_duty_splits_the_period_evenly() {
+        let (on, off) = timings(50.0, PWM_FREQUENCY).expect("half duty needs a thread");
+        assert_eq!(ns(on), ns(off));
+    }
 
     /// Drive a full dial rotation of `pulses` impulses and return the digit.
     fn rotate(pulses: u32) -> Option<u32> {
