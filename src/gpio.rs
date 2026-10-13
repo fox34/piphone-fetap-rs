@@ -38,6 +38,35 @@ const IDLE_WAIT: Duration = Duration::from_secs(3600);
 /// not turn that into minutes of busy work.
 const MAX_SAMPLES: u32 = 10_000;
 
+/// How many 1 ms samples `elapsed` is worth, and what is left over for the next
+/// call.
+///
+/// Only the sub-millisecond remainder is carried forward, which is what keeps the
+/// samples exactly one millisecond apart over a whole dial rotation instead of
+/// drifting. The time that does not fit through [`MAX_SAMPLES`] is *dropped*.
+///
+/// Dropping it is the whole point. Carrying it is the more obvious bookkeeping
+/// and it is wrong: the leftover is added in again on the next call, and on the
+/// one after that, so a single gap longer than the cap leaves `carry` holding
+/// however long the phone sat unused and makes every later call step the decoder
+/// through ten seconds of contact levels at a time. The debounce is then measured
+/// against those ten seconds instead of against real time, and every bounce of the
+/// dial contacts - which is what `NSA_DEBOUNCE` exists to reject - reads as a full
+/// rotation and yields a digit of its own. A single rotation of "0" then arrives
+/// as `0` followed by a handful of `0`s, no short code matches any more, and the
+/// phone reports "number too long" until it is restarted.
+fn grid(elapsed: Duration, carry: Duration) -> (u32, Duration) {
+    let total = carry + elapsed;
+    let samples = total.as_nanos() / DIAL_SAMPLE.as_nanos();
+
+    if samples > u128::from(MAX_SAMPLES) {
+        return (MAX_SAMPLES, Duration::ZERO);
+    }
+
+    let samples = samples as u32;
+    (samples, total - DIAL_SAMPLE * samples)
+}
+
 /// Position of the impulse contact inside the single line request.
 const NSI: usize = 0;
 
@@ -582,17 +611,16 @@ impl Watcher {
 
     /// Feed the decoder the samples the current levels added up to `until`.
     ///
-    /// The leftovers stay in `carry`, so the samples stay exactly one
-    /// millisecond apart over a whole dial rotation instead of drifting.
+    /// The sub-millisecond leftovers stay in `carry`, so the samples stay exactly
+    /// one millisecond apart over a whole dial rotation instead of drifting. A gap
+    /// that outgrows [`MAX_SAMPLES`] loses its tail instead - see [`grid`].
     fn advance(&mut self, until: Duration, digits: &mut Vec<u32>) {
         let Some(from) = self.applied else {
             self.applied = Some(until);
             return;
         };
 
-        let elapsed = self.carry + until.saturating_sub(from);
-        let samples = (elapsed.as_nanos() / DIAL_SAMPLE.as_nanos()).min(u128::from(MAX_SAMPLES)) as u32;
-        self.carry = elapsed - DIAL_SAMPLE * samples;
+        let (samples, carry) = grid(until.saturating_sub(from), self.carry);
 
         for _ in 0..samples {
             if let Some(digit) = self.decoder.step(self.nsi_low, self.nsa_low) {
@@ -600,6 +628,7 @@ impl Watcher {
             }
         }
 
+        self.carry = carry;
         self.applied = Some(until);
     }
 
@@ -878,5 +907,95 @@ mod tests {
         }
 
         assert_eq!(digits, vec![3, 7]);
+    }
+
+    #[test]
+    fn a_long_gap_is_dropped_instead_of_carried_forward() {
+        // The phone sits unused for hours between calls, so the first change after
+        // an idle period is capped - that part is fine.
+        let (samples, carry) = grid(Duration::from_secs(300), Duration::ZERO);
+        assert_eq!(samples, MAX_SAMPLES, "the cap bounds the work");
+
+        // What must not survive is the tail. Carried, it is fed in again on the
+        // next call and the one after, and every call would keep stepping the
+        // decoder through MAX_SAMPLES worth of levels no matter how little time
+        // had actually passed.
+        assert_eq!(carry, Duration::ZERO, "the unfed time is dropped");
+
+        // The call right after an idle period is the one that matters: it has to
+        // see only the milliseconds that really went by.
+        let (samples, carry) = grid(DIAL_SAMPLE * 5, carry);
+        assert_eq!(samples, 5, "five milliseconds must stay five milliseconds");
+        assert_eq!(carry, Duration::ZERO);
+    }
+
+    #[test]
+    fn the_sub_millisecond_remainder_is_kept() {
+        // This is what `carry` is for: the samples stay exactly one millisecond
+        // apart across a whole rotation instead of drifting by the rounding.
+        let (_, carry) = grid(Duration::from_nanos(1_100_000), Duration::ZERO);
+        assert_eq!(carry, Duration::from_micros(100));
+
+        // The next millisecond starts where the last one stopped, not where the
+        // caller's rounding left off.
+        let (samples, carry) = grid(Duration::from_nanos(950_000), carry);
+        assert_eq!(samples, 1);
+        assert_eq!(carry, Duration::from_micros(50), "nothing is lost across two calls");
+    }
+
+    /// The NSA contact bounces for a few milliseconds when the dial snaps back.
+    /// `NSA_DEBOUNCE` is what tells that apart from a turn - but only if the
+    /// decoder is fed the time that really passed. A grid flooded with
+    /// `MAX_SAMPLES` stretches every bounce to ten seconds, which reads as a full
+    /// rotation and produces a digit of its own.
+    #[test]
+    fn a_flooded_grid_turns_a_bounce_into_a_digit() {
+        let mut honest = PulseDecoder::new();
+        let mut digits = Vec::new();
+
+        // A five millisecond bounce: one tick of NSA, and back.
+        for _ in 0..5 {
+            digits.extend(honest.step(true, true));
+        }
+        for _ in 0..5 {
+            digits.extend(honest.step(true, false));
+        }
+        assert_eq!(digits, Vec::<u32>::new(), "a bounce is not a rotation");
+
+        // The same bounce on a flooded grid. This is what the leftover in `carry`
+        // used to produce, once the phone had been idle for longer than the cap.
+        let mut flooded = PulseDecoder::new();
+        let mut digits = Vec::new();
+
+        for _ in 0..MAX_SAMPLES {
+            digits.extend(flooded.step(true, true));
+        }
+        for _ in 0..MAX_SAMPLES {
+            digits.extend(flooded.step(true, false));
+        }
+        assert_eq!(digits, vec![0], "ten seconds of contact is a rotation");
+    }
+
+    #[test]
+    fn the_cap_still_settles_a_rotation_that_was_interrupted() {
+        // Truncating must not leave the decoder stuck: the levels that follow a
+        // dropped gap are still constant, so feeding the cap settles the debounce
+        // and the digit is reported once real time has passed again.
+        let mut decoder = PulseDecoder::new();
+        let settle = NSA_TICK_SAMPLES * (NSA_DEBOUNCE + 5);
+
+        // Turn away from rest, then lose the thread for longer than the cap.
+        for _ in 0..settle {
+            decoder.step(true, true);
+        }
+        assert!(decoder.counting, "the turn was seen");
+
+        // Back at rest, fed the cap rather than the hours that really passed.
+        let mut digit = None;
+        for _ in 0..MAX_SAMPLES {
+            digit = decoder.step(true, false).or(digit);
+        }
+        assert_eq!(digit, Some(0), "the digit survives the gap");
+        assert!(!decoder.counting, "and the decoder is idle again");
     }
 }
