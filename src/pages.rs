@@ -74,7 +74,16 @@ const formatUptime = s => s == null ? '–'
   : [Math.floor(s / 86400), Math.floor(s / 3600) % 24, Math.floor(s / 60) % 60, s % 60]
       .map((v, i) => i === 0 ? `${v} Tage` : i === 1 ? `${v} Std` : i === 2 ? `${v} Min` : `${v} Sek`).join(' ');
 
-const formatDate = s => s ? new Date(s).toLocaleString('de-DE', {weekday: 'short', hour: '2-digit', minute: '2-digit'}) : '–';
+// A date that does not parse used to surface as a literal "Invalid Date" on the
+// page, which looks like a bug rather than a missing value - so fall back to the
+// dash instead. The API sends full ISO 8601, which is what `new Date` wants;
+// note that a bare "HH:MM" is *not* parseable, so a time-only field cannot be
+// passed through this.
+const formatDate = s => {
+  if (!s) return '–';
+  const d = new Date(s);
+  return isNaN(d) ? '–' : d.toLocaleString('de-DE', {weekday: 'short', hour: '2-digit', minute: '2-digit'});
+};
 const bool = v => v ? 'Ja' : 'Nein';
 const classFor = v => v ? 'on' : 'off';
 

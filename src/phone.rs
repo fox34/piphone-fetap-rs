@@ -80,7 +80,7 @@ pub struct Phone {
     manual_dnd: AtomicBool,
     sleep_music_running: AtomicBool,
     stop_sleep_music: AtomicBool,
-    next_wake_up: Mutex<Option<NaiveTime>>,
+    next_wake_up: Mutex<Option<chrono::NaiveDateTime>>,
 
     /// Set once the SIP stack reported its first registration; gates the boot sound.
     first_boot: AtomicBool,
@@ -663,7 +663,7 @@ impl Phone {
         };
 
         println!("Aktiviere Nachtlicht bis {}.", wake_up.format("%Y-%m-%d %H:%M"));
-        *self.next_wake_up.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake_up.time());
+        *self.next_wake_up.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake_up);
 
         let seconds = seconds_until(wake_up);
         let phone = self.clone();
@@ -1038,10 +1038,14 @@ impl PhoneApi for Arc<Phone> {
             "wake_up_mode": self.led.wake_light_on_state(),
             "sleep_music": self.sleep_music_running.load(Ordering::SeqCst),
             "dnd": self.is_dnd_active(),
+            // Full ISO 8601, because the page hands this to `new Date()`, and a
+            // bare "%H:%M" is not a parseable date. The date has to be in there
+            // too: the next wake-up may well be tomorrow, and the page shows the
+            // weekday.
             "next_wake_up": self.next_wake_up
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .map(|t| t.format("%H:%M").to_string()),
+                .map(|t| t.format("%Y-%m-%dT%H:%M:%S").to_string()),
             "config_changed": self.config_changed.load(Ordering::SeqCst),
         })
     }

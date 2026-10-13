@@ -208,6 +208,27 @@ async fn state_is_json() {
 }
 
 #[tokio::test]
+async fn next_wake_up_is_a_parseable_date() {
+    // The status page runs this string through `new Date()`, which cannot parse
+    // a bare "HH:MM" - it rendered "Invalid Date" on the page. It also needs the
+    // date, because the next wake-up can be tomorrow and the page shows the
+    // weekday.
+    let client = Client::new();
+    let (_, _, data) = client.get("/api/state").await;
+
+    let Some(value) = data["next_wake_up"].as_str() else {
+        // No night mode running is a legitimate state, and then it must be null.
+        assert!(data["next_wake_up"].is_null(), "next_wake_up is neither a string nor null");
+        return;
+    };
+
+    assert!(
+        chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S").is_ok(),
+        "next_wake_up {value:?} is not ISO 8601, so the page cannot parse it"
+    );
+}
+
+#[tokio::test]
 async fn config_schema_has_every_section_in_order() {
     let client = Client::new();
     let (status, _, data) = client.get("/api/config").await;
