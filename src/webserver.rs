@@ -21,36 +21,14 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde_json::Value as Json_;
 
+use crate::command::Command;
 use crate::pages::{CONFIG_PAGE, PAGE};
 
 /// Refuse request bodies larger than this, matching the Python version.
+///
+/// Applied to the router, so an oversized body is turned away while it is still
+/// arriving instead of after it has been buffered.
 const MAX_BODY: usize = 1_000_000;
-
-/// Actions the status page may trigger.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action {
-    NightMode,
-    SleepMusic,
-    TestLoudspeaker,
-    TestEarpiece,
-    Reboot,
-    Shutdown,
-}
-
-impl Action {
-    /// Parse an action name from the URL.
-    pub fn parse(name: &str) -> Option<Self> {
-        Some(match name {
-            "night-mode" => Action::NightMode,
-            "sleep-music" => Action::SleepMusic,
-            "test-loudspeaker" => Action::TestLoudspeaker,
-            "test-earpiece" => Action::TestEarpiece,
-            "reboot" => Action::Reboot,
-            "shutdown" => Action::Shutdown,
-            _ => return None,
-        })
-    }
-}
 
 /// Callbacks into the phone, supplied by `main`.
 pub trait PhoneApi: Send + Sync + 'static {
@@ -64,7 +42,7 @@ pub trait PhoneApi: Send + Sync + 'static {
     fn save_config(&self, payload: Json_) -> Json_;
 
     /// Run an action. May block (waiting for a tone, powering down).
-    fn run_action(&self, action: Action);
+    fn run_action(&self, action: Command);
 }
 
 /// Shared state handed to the handlers.
@@ -86,6 +64,10 @@ pub fn router<A: PhoneApi>(api: Arc<A>, credentials: Option<String>, verbose: bo
         .route("/api/config", get(api_config).post(post_config))
         .route("/api/action/{name}", post(api_action))
         .fallback(not_found)
+        // Refuse a body while it is still coming in, rather than reading all of
+        // it into memory and measuring afterwards: the whole point of a limit is
+        // not to hand the limit's worth of bytes to the process first.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .with_state(Arc::new(server))
 }
 
@@ -144,13 +126,6 @@ async fn post_config<A: PhoneApi>(
 ) -> Response {
     authorized!(server, &headers);
 
-    if body.len() > MAX_BODY {
-        return json_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            serde_json::json!({"error": "Anfrage zu groß"}),
-        );
-    }
-
     let payload: Json_ = if body.is_empty() {
         serde_json::json!({})
     } else {
@@ -176,7 +151,7 @@ async fn api_action<A: PhoneApi>(
 ) -> Response {
     authorized!(server, &headers);
 
-    let Some(action) = Action::parse(&name) else {
+    let Some(action) = Command::from_web(&name) else {
         return json_response(
             StatusCode::NOT_FOUND,
             serde_json::json!({"error": format!("Unbekannte Aktion: {}", name)}),
@@ -283,7 +258,7 @@ mod tests {
         fn save_config(&self, _payload: Json_) -> Json_ {
             serde_json::json!({"ok": true})
         }
-        fn run_action(&self, _action: Action) {}
+        fn run_action(&self, _action: Command) {}
     }
 
     fn header(value: &str) -> axum::http::HeaderMap {
@@ -326,12 +301,5 @@ mod tests {
         let response = server.check_auth(&axum::http::HeaderMap::new()).unwrap_err();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
-    }
-
-    #[test]
-    fn action_names_round_trip() {
-        assert_eq!(Action::parse("night-mode"), Some(Action::NightMode));
-        assert_eq!(Action::parse("shutdown"), Some(Action::Shutdown));
-        assert_eq!(Action::parse("unknown"), None);
     }
 }

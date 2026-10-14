@@ -51,13 +51,17 @@ A sample feature-complete configuration file is provided in `support/config-exam
 
 | Path | Contents |
 | --- | --- |
-| `src/phone.rs` | The state machine: dial, hook switch, features, watchdog |
+| `src/phone/mod.rs` | The state machine: dial, hook switch, features, watchdog |
+| `src/phone/schedule.rs` | Ringing lock window, caller whitelist, next wake-up |
+| `src/phone/web.rs` | The `PhoneApi` implementation behind the web interface |
 | `src/sip.rs` | `rvoip` endpoint wrapper, event loop, call decisions |
 | `src/callaudio.rs` | ALSA bridge between the SIP stack and the USB sound card |
 | `src/audio.rs` | Sound playback: symphonia decoding plus ALSA, for the `i2s` amplifier and the `usb` earpiece; the call-progress tones are generated in memory |
 | `src/gpio.rs` | Pulse decoding, watcher thread, LEDs with software PWM |
 | `src/gpio/linux.rs` | `gpiod` backend, the only hardware-touching module |
 | `src/config.rs` | Schema, validation, reading and writing the TOML file |
+| `src/command.rs` | The features and the names the dial and the web URL use for them |
+| `src/sync.rs` | `lock()`, the one place that says how poisoning is handled |
 | `src/webserver.rs` | axum routes, basic auth, actions |
 | `src/pages.rs` | The HTML pages, rendered from the schema |
 | `src/main.rs` | Argument parsing and startup |
@@ -77,7 +81,9 @@ cargo build --release
 ```
 
 Tests need no hardware. They must be linked serially on a Pi, because the linker is the memory
-peak: `cargo test -j 1`.
+peak: `cargo test -j 1`. The hardware test tools in `examples/` are behind the `harness` feature so
+that `cargo test` does not build them - that alone is nine fewer binaries to link on a machine that
+barely manages one. Run them with `cargo run --features harness --example <name>`.
 
 The web pages have their own tests, run with node and jsdom:
 
@@ -87,15 +93,16 @@ npm install && node tests/test-webpage.js
 
 # Hardware test tools
 
-Each opens the pins it needs, so run them one at a time:
+Each opens the pins it needs, so run them one at a time. All of them need the `harness`
+feature, which `cargo run --example` does not switch on by itself:
 
-- `cargo run --example hardware-connections` — live state of dial, impulse contact and hook switch
-- `cargo run --example hardware-dial` — decodes dialled digits
-- `cargo run --example hardware-audio` — ringtones, loudspeaker and earpiece test, opens the call bridge
-- `cargo run --example gpio-probe` — reads raw pin levels and watches for edges, for diagnosing wiring
-- `cargo run --example audio-probe -- <device> <rate> <channels>` — tries ALSA parameter combinations
-- `cargo run --example decode-probe -- sounds` — decodes every file in `sounds/`, no sound card needed
-- `cargo run --example playback-probe -- sounds` — plays WAV and MP3 on both devices and the generated tones in
+- `cargo run --features harness --example hardware-connections` — live state of dial, impulse contact and hook switch
+- `cargo run --features harness --example hardware-dial` — decodes dialled digits
+- `cargo run --features harness --example hardware-audio` — ringtones, loudspeaker and earpiece test, opens the call bridge
+- `cargo run --features harness --example gpio-probe` — reads raw pin levels and watches for edges, for diagnosing wiring
+- `cargo run --features harness --example audio-probe -- <device> <rate> <channels>` — tries ALSA parameter combinations
+- `cargo run --features harness --example decode-probe -- sounds` — decodes every file in `sounds/`, no sound card needed
+- `cargo run --features harness --example playback-probe -- sounds` — plays WAV and MP3 on both devices and the generated tones in
   the earpiece, checks the repeat loop and an early stop, and verifies each sound lasts as long as the file says
   (`playback-probe -- sounds tones` leaves out the files and only plays the tones, which is quiet enough to repeat
   on a phone that is in service)
@@ -122,6 +129,40 @@ schema is rendered dynamically into forms by the JS in `src/pages.rs`, so adding
 Changes are never applied to the running process and never trigger a restart; the UI points out
 that a restart is required. Writing the file regenerates all comments from the schema, so comments
 written by hand in the file are not preserved.
+
+The file is saved through a temporary file that is written, read back, compared and only then moved
+into place. Its name carries the process id *and* a counter, because two tabs in a browser are
+enough to make two saves overlap - with one shared `.tmp` they would take each other's control file
+away and leave one of the two half written behind.
+
+The phone runs on the values as they stand in the file, not on the checked ones, so a rejected value
+is used as written rather than replaced by its default. That is deliberate for a physical device - a
+defaulted GPIO pin would quietly point somewhere else - but it means the validation errors have to
+be said out loud, which `Phone::new` does at startup.
+
+# Code structure
+
+Three things are single points of truth on purpose. Each replaced two places that used to have to be
+kept in step by hand, and each is a place where being out of step was silent rather than loud:
+
+- **`src/command.rs` holds every feature and both of its names.** A feature is reachable as the
+  target of a short code in `[numbers]` (`enable-night-mode`) and as an action URL
+  (`/api/action/night-mode`), and the two names are different. `Command::dial_name` /
+  `web_name` and the `from_dial` / `from_web` lookups replace what used to be a list of dial names
+  in `config.rs`, a `parse` in `webserver.rs`, and two dispatch arms. `DIAL_NAMES` - what the schema
+  accepts and suggests - is derived from the enum, so it cannot drift from what the dial
+  understands. Adding a feature is adding a variant. Worth keeping: an unknown target used to fall
+  through to the "place a call" arm, so a mistyped command name made the phone dial the typo.
+- **`Timer` is the only way to arm a timed job.** See the platform notes for what that costs.
+- **`crate::sync::lock()` is the only way to take a mutex.** Sixty-odd call sites said
+  `lock().unwrap_or_else(|e| e.into_inner())` between them, which is noise at every one of them and
+  says nothing. The reasoning is in the module: `panic = "abort"` means a release build cannot hit
+  it at all, and under the profiles that unwind, the data behind a poisoned lock is still good.
+
+The state machine itself is `src/phone/mod.rs`, with the two parts of it that are not the state
+machine next door: `schedule.rs` for the decisions that are pure functions of the clock and the
+configuration, and `web.rs` for the `PhoneApi` view. All three are one module, so `web.rs` can still
+read the phone's private state; the split is about navigation, not access.
 
 # Platform notes
 
@@ -209,3 +250,43 @@ written by hand in the file are not preserved.
 - **A call that is still ringing has no answered handle.** `current_call` is only set once a call is
   answered, so hanging up during setup used to do nothing and left the other end ringing. Hangup
   falls back to the outgoing `CallId`, which rvoip turns into a proper CANCEL.
+- **A timer has to be *aborted*, not forgotten.** Every timed job is "do this in a while, unless
+  something comes along first", and dropping a `JoinHandle` instead of aborting it leaves the job
+  running with nothing left to cancel it. That is how an abandoned ring timer came to decline
+  whichever call was ringing by the time it fired - and, if that call had meanwhile been answered,
+  to send a `Hangup` into a live conversation. `Timer` in `src/phone/mod.rs` is therefore the only
+  way to arm one: `start` cancels first, so there is nothing to remember.
+- **The ringing lock is a window, and hour zero is inside it.** `dnd_from`/`dnd_to` are an evening-
+  to-morning range, so `from > to` is the normal case and midnight belongs to the window. The old
+  condition spelled that `0 < hour && hour <= to || 0 < from && from <= hour`, where the `0 < hour`
+  guard kept `to = 0` switched off - and left the hour between midnight and one o'clock unlocked, so
+  the phone rang at half past midnight. A zero now switches the lock off at the *bounds*, which frees
+  the hour itself to be compared like any other. The same branch also stops a `from <= to` window
+  from running on until midnight.
+- **Night mode is "the light is on", not "a timer is running".** Both ways into the mode - night
+  mode itself, and the wake-up light that replaces it - are just the night light being lit, and the
+  two error paths switch it on *and then* give up when the wake-up times turn out to be unusable.
+  Deriving the state from the timer left those runs with no way to switch the light off again:
+  the next code took the "start" branch, because there was no timer, and lit it once more.
+- **The GPIO watcher thread must not wait for anything.** It is the thread that has to notice the
+  handset going down and the next digit coming in. Work that waits - a confirmation tone, the
+  earpiece test with its deliberate half-second pause - goes to `background()`, which is the runtime's
+  blocking pool. The dial decoding survives a blocked watcher either way, because the kernel
+  timestamps the edges and they are buffered, but the hook switch does not: lifting the handset
+  during the confirmation tone did nothing for as long as the tone played, and an incoming call was
+  not even seen.
+- **`SipCommand::Shutdown` is the clean way out.** On SIGTERM the session hangs up and unregisters
+  before it ends, so the other end gets a BYE. Just exiting stops the RTP and sends nothing, and the
+  caller only learns about the end from their own session timer - long enough to be a noticeable
+  stretch of dead air with the handset still against their ear. `Phone::stop_sip` sends the command
+  and waits a second, because the teardown is not observable from the outside.
+- **The outgoing audio pump is woken, not polled.** The sender used to look for a frame and, finding
+  none, wait out the whole 20 ms frame clock before looking again - which added most of a frame to
+  every frame that arrived just after a look, and that is the caller's own voice. `RingBuffer` now
+  carries a `Notify` and `AudioBridge::arrivals` hands it to the pump. Note that the wait has to be
+  preceded by the pop: the frame can arrive in between, and `Notify` keeping a permit is what makes
+  that frame count instead of being lost for another 20 ms.
+- **The RTP clock advances by what was really sent.** `pcmu_sized_mono_8khz` only labels the rate, it
+  does not pad the frame, and the capture thread hands back `buffer[..count]` with whatever the card
+  returned. A fixed `FRAME_SAMPLES` per frame therefore drifts against the payload as soon as a read
+  wakes early.

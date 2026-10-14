@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::sync::lock;
+
 #[cfg(target_os = "linux")]
 #[path = "gpio/linux.rs"]
 mod backend;
@@ -312,7 +314,7 @@ impl Led {
         override_duty: Option<f64>,
     ) {
         if let Some(output) = light {
-            let mut output = output.lock().unwrap_or_else(|e| e.into_inner());
+            let mut output = lock(&output);
             if on {
                 output.start_pwm(override_duty.unwrap_or(duty), PWM_FREQUENCY);
             } else {
@@ -346,7 +348,7 @@ impl Led {
     /// Blink the status LED while booting, so the phone signals that it starts.
     pub fn wake_light_blink(&self) {
         if let Some(output) = &self.wake {
-            let mut output = output.lock().unwrap_or_else(|e| e.into_inner());
+            let mut output = lock(&output);
             output.start_pwm(50.0, BLINK_FREQUENCY);
         }
     }

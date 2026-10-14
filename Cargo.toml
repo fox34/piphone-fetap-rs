@@ -15,6 +15,14 @@ path = "src/main.rs"
 name = "piphone"
 path = "src/lib.rs"
 
+[features]
+# The hardware test tools in `examples/`. Off by default so that `cargo test`
+# does not build nine extra binaries: on the Pi the linker is the memory peak,
+# and AGENTS.md requires the tests to be linked serially for exactly that
+# reason. Run them with `--features harness`, e.g.
+# `cargo run --features harness --example hardware-dial`.
+harness = []
+
 [dependencies]
 # Async runtime - also required by rvoip
 tokio = { version = "1", features = [
@@ -83,6 +91,44 @@ tempfile = "3"
 # external client.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+
+# The hardware test tools. See the `harness` feature above for why they are
+# listed one by one rather than picked up automatically.
+[[example]]
+name = "audio-probe"
+required-features = ["harness"]
+
+[[example]]
+name = "decode-probe"
+required-features = ["harness"]
+
+[[example]]
+name = "gpio-probe"
+required-features = ["harness"]
+
+[[example]]
+name = "hardware-audio"
+required-features = ["harness"]
+
+[[example]]
+name = "hardware-connections"
+required-features = ["harness"]
+
+[[example]]
+name = "hardware-dial"
+required-features = ["harness"]
+
+[[example]]
+name = "incoming-probe"
+required-features = ["harness"]
+
+[[example]]
+name = "playback-probe"
+required-features = ["harness"]
+
+[[example]]
+name = "render-page"
+required-features = ["harness"]
 
 # https://github.com/johnthagen/min-sized-rust
 [profile.release]

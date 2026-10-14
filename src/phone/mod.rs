@@ -3,6 +3,14 @@
 //! Runs on a Raspberry Pi Zero 2W inside an FeTAp-style phone: a rotary dial
 //! provides the short codes, a hook switch handles the handset, two LEDs show
 //! night and wake-up mode, and SIP calls are handled by the `rvoip` stack.
+//!
+//! This module is the state machine: what the phone does. Two things that are
+//! not that live next door - [`schedule`] for the decisions that are pure
+//! functions of the clock and the configuration, and [`web`] for the view the
+//! HTTP layer gets of all this.
+
+mod schedule;
+mod web;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -10,16 +18,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{Datelike, Local, NaiveTime, Timelike};
+use chrono::{Local, Timelike};
 use rand::seq::SliceRandom;
-use serde_json::Value as Json_;
 use tokio::sync::mpsc;
 
+use schedule::{dnd_window_active, known_caller, next_wake_up, seconds_until};
+
 use crate::audio::{Audio, Tone};
+use crate::command::Command;
 use crate::config::{self, Table};
 use crate::gpio::{Gpio, Led, Watcher};
 use crate::sip::{CallDecision, SipClient, SipEvent};
-use crate::webserver::{Action, PhoneApi};
+use crate::sync::lock;
 
 /// ALSA device holding the earpiece and microphone. See
 /// [`crate::callaudio::CALL_DEVICE`] for why the plugin wrapper is needed.
@@ -96,12 +106,6 @@ pub struct Phone {
 
     /// The call that is currently ringing, awaiting the user's decision.
     pending_call: Mutex<Option<mpsc::Sender<CallDecision>>>,
-    ring_timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
-
-    /// Wake-up timer, cancelled when night mode is switched off again.
-    night_light_timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    dial_timeout: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    call_duration_timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
 
     /// Commands sent to the SIP task.
     ///
@@ -113,6 +117,64 @@ pub struct Phone {
     /// `None` while a session holds it; the session gives it back when it ends,
     /// so a command issued during a reconnect is not lost.
     sip_receiver: Mutex<Option<mpsc::Receiver<SipCommand>>>,
+
+    /// Give up on a call nobody picked up.
+    ring_timeout: Timer,
+    /// Switch the wake-up light on when the night ends.
+    night_light: Timer,
+    /// Abandon a partly dialled number.
+    dial_timeout: Timer,
+    /// End a call that runs past its limit.
+    call_duration: Timer,
+}
+
+/// A one-shot timer that replaces itself instead of stacking up.
+///
+/// Every timed job in the phone is "do this in a while, unless something else
+/// comes along first": a second call rings while the first is still ringing, a
+/// digit follows a digit, night mode is switched off before it ever woke up.
+/// So the previous job has to be *aborted*, not merely forgotten - dropping its
+/// handle would leave it running with nothing left to cancel it, which is how an
+/// abandoned ring timer came to decline whichever call was ringing by the time
+/// it fired.
+///
+/// Holding the invariant in one type is the point: a caller cannot forget to
+/// cancel, because there is only one way to arm a timer.
+struct Timer {
+    /// The runtime the job is started on.
+    ///
+    /// Stored rather than reached for, because the dial arms these timers from
+    /// the GPIO watcher thread, which has no reactor of its own.
+    runtime: tokio::runtime::Handle,
+    handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Timer {
+    fn new(runtime: &tokio::runtime::Handle) -> Self {
+        Timer { runtime: runtime.clone(), handle: Mutex::new(None) }
+    }
+
+    /// Run `job` after `delay`, cancelling whatever this timer was running.
+    fn start<F>(&self, delay: Duration, job: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.cancel();
+
+        let handle = self.runtime.spawn(async move {
+            tokio::time::sleep(delay).await;
+            job();
+        });
+
+        *lock(&self.handle) = Some(handle);
+    }
+
+    /// Stop the job, if one is running. Harmless when nothing is.
+    fn cancel(&self) {
+        if let Some(handle) = lock(&self.handle).take() {
+            handle.abort();
+        }
+    }
 }
 
 /// Command channel into the SIP task.
@@ -142,7 +204,17 @@ impl Phone {
             .map_err(|e| format!("Konfigurationsdatei {} ist kein gültiges TOML: {}", options.config.display(), e))?;
 
         // The baseline is taken before --ignore-dnd so that flag never reaches the file.
-        let baseline = config::validate(&config, None).0;
+        let (baseline, errors) = config::validate(&config, None);
+        if !errors.is_empty() {
+            // The phone runs on the values as they stand in the file rather than
+            // on the checked ones, so a rejected value is not replaced by its
+            // default here - it is used as written. Saying so is the only warning
+            // the user gets, and it used to be thrown away with the tuple.
+            println!("Konfiguration enthält {} Fehler; die Werte aus der Datei werden verwendet:", errors.len());
+            for (key, message) in errors.iter() {
+                println!(" - {}: {}", key, message);
+            }
+        }
 
         if options.ignore_dnd {
             if let Some(sip) = section_mut(&mut config, "sip") {
@@ -182,6 +254,12 @@ impl Phone {
         let (sip_commands, sip_receiver) = mpsc::channel(16);
         let sip_receiver = Mutex::new(Some(sip_receiver));
 
+        // The timed jobs get the same handle, for the same reason.
+        let ring_timeout = Timer::new(&runtime);
+        let night_light = Timer::new(&runtime);
+        let dial_timeout = Timer::new(&runtime);
+        let call_duration = Timer::new(&runtime);
+
         let phone = Arc::new(Phone {
             options,
             config,
@@ -205,10 +283,10 @@ impl Phone {
             call_up: AtomicBool::new(false),
             dial_digits: Mutex::new(String::new()),
             pending_call: Mutex::new(None),
-            ring_timer: Mutex::new(None),
-            night_light_timer: Mutex::new(None),
-            dial_timeout: Mutex::new(None),
-            call_duration_timer: Mutex::new(None),
+            ring_timeout,
+            night_light,
+            dial_timeout,
+            call_duration,
             sip_commands: Mutex::new(sip_commands),
             sip_receiver,
         });
@@ -257,11 +335,25 @@ impl Phone {
 
     /// Numbers the rotary dial may call or which may call us.
     pub fn numbers(&self) -> Vec<(String, String)> {
-        self.config
-            .get("numbers")
-            .and_then(|v| v.as_table())
+        self.numbers_table()
             .map(|table| table.iter().map(|(k, v)| (k.clone(), v.to_display_string())).collect())
             .unwrap_or_default()
+    }
+
+    /// The `[numbers]` table itself, without copying it.
+    fn numbers_table(&self) -> Option<&Table> {
+        self.config.get("numbers").and_then(|v| v.as_table())
+    }
+
+    /// The action `code` stands for, if `[numbers]` has an entry for it.
+    ///
+    /// Straight from the table: looking one code up used to copy every
+    /// configured number into a list first, and this runs once per digit while
+    /// a number is being dialled.
+    fn action_for(&self, code: &str) -> Option<String> {
+        self.numbers_table()
+            .and_then(|table| table.get(code))
+            .map(|v| v.to_display_string())
     }
 
     /// Ringtone configured for a caller, falling back to the generic one.
@@ -278,7 +370,7 @@ impl Phone {
 
     /// A digit came in from the rotary dial.
     fn on_digit(self: &Arc<Self>, digit: u32) {
-        let mut digits = self.dial_digits.lock().unwrap_or_else(|e| e.into_inner());
+        let mut digits = lock(&self.dial_digits);
         if digits.len() >= MAX_DIAL_CODE {
             // Too many digits: abandon this attempt.
             println!("Ziffernfolge zu lang, beende Wahlvorgang.");
@@ -294,14 +386,10 @@ impl Phone {
         drop(digits);
 
         // A code fires as soon as it is complete, so longer codes still work.
-        let action = self
-            .numbers()
-            .into_iter()
-            .find(|(code, _)| *code == number)
-            .map(|(_, a)| a);
+        let action = self.action_for(&number);
 
         if let Some(action) = action {
-            self.dial_digits.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            lock(&self.dial_digits).clear();
             println!("Gewählt: {} -> {}", number, action);
             self.stop_dial_timeout();
             self.audio.stop_earpiece();
@@ -309,100 +397,123 @@ impl Phone {
         }
     }
 
+    /// Hand a piece of dial-triggered work to a blocking task and return at once.
+    ///
+    /// Everything the rotary dial triggers runs on the GPIO watcher thread, and
+    /// that thread is the one that notices the handset going back down and the
+    /// next digit coming in. Work that waits - for a tone to finish, or for the
+    /// deliberate pause in front of the earpiece test - used to hold it for the
+    /// whole sound, so lifting the handset during the confirmation tone did
+    /// nothing for as long as the tone played, and an incoming call was not even
+    /// seen. The runtime's blocking pool is where that work belongs; this is the
+    /// same route the sleep music already took, and it needs the stored handle,
+    /// because the watcher has no reactor of its own.
+    fn background<F>(self: &Arc<Self>, work: F)
+    where
+        F: FnOnce(&Arc<Self>) + Send + 'static,
+    {
+        let phone = self.clone();
+        self.runtime.spawn_blocking(move || work(&phone));
+    }
+
     /// Perform the action a short code stands for.
     fn run_dial_action(self: &Arc<Self>, action: &str) {
-        match action {
-            "enable-night-mode" => {
+        // Anything that is not one of the commands is a number, and that is the
+        // one thing on the dial that needs the handset in the hand: the commands
+        // are allowed to be triggered from the cradle (the night light is
+        // switched on before going to bed, with the phone lying unused). Without
+        // this the phone dialled out while it was sitting there.
+        let Some(command) = Command::from_dial(action) else {
+            self.place_call(action);
+            return;
+        };
+
+        self.run_command(command);
+    }
+
+    /// Carry out one command, whichever name it arrived under.
+    fn run_command(self: &Arc<Self>, command: Command) {
+        match command {
+            Command::NightMode => {
                 self.start_night_mode();
-                self.audio.play_speaker(&self.sound("action_confirmed")).wait();
+                self.background(|phone| {
+                    phone.audio.play_speaker(&phone.sound("action_confirmed")).wait()
+                });
             }
-            "play-sleep-music" => self.toggle_sleep_music(),
-            "test-loudspeaker" => self.test_loudspeaker(),
-            "test-earpiece" => self.test_earpiece(),
-            "reboot" => {
+            Command::SleepMusic => self.toggle_sleep_music(),
+            Command::TestLoudspeaker => self.test_loudspeaker(),
+            Command::TestEarpiece => self.test_earpiece(),
+            Command::Reboot => {
                 self.reboot();
                 std::process::exit(0);
             }
-            "shutdown" => {
+            Command::Shutdown => {
                 self.shutdown();
                 std::process::exit(0);
             }
-            number => {
-                // Placing a call is the one thing on the dial that needs the
-                // handset in the hand: the commands above are allowed to be
-                // triggered from the cradle (the night light is switched on
-                // before going to bed, with the phone lying unused). Without
-                // this the phone dialled out while it was sitting there.
-                if self.is_hungup() {
-                    println!("Hörer liegt auf der Gabel, {} wird nicht gewählt.", number);
-                    return;
-                }
+        }
+    }
 
-                if !self.is_connected.load(Ordering::SeqCst) {
-                    self.audio.play_earpiece_tone(Tone::Besetzt);
-                    return;
-                }
-                println!("Rufe Nummer an: {}", number);
-                let host = config::option_str(&self.config, "sip", "host");
+    /// Dial `number`, which is known to be a number rather than a command.
+    fn place_call(self: &Arc<Self>, number: &str) {
+        if self.is_hungup() {
+            println!("Hörer liegt auf der Gabel, {} wird nicht gewählt.", number);
+            return;
+        }
 
-                // The number is complete, so the time to enter one is over. The
-                // old timer would otherwise fire in the middle of the call and
-                // put the busy tone into the conversation.
-                self.stop_dial_timeout();
+        if !self.is_connected.load(Ordering::SeqCst) {
+            self.audio.play_earpiece_tone(Tone::Besetzt);
+            return;
+        }
+        println!("Rufe Nummer an: {}", number);
+        let host = config::option_str(&self.config, "sip", "host");
 
-                self.send_command(SipCommand::Call {
-                    number: number.to_string(),
-                    host,
-                });
+        // The number is complete, so the time to enter one is over. The
+        // old timer would otherwise fire in the middle of the call and
+        // put the busy tone into the conversation.
+        self.stop_dial_timeout();
 
-                // Nothing comes back from the other end while it is still
-                // ringing, so the caller hears the ringback until the call is
-                // answered or ends. Both stop it again.
-                self.audio.play_earpiece_tone(Tone::Freiton);
+        self.send_command(SipCommand::Call {
+            number: number.to_string(),
+            host,
+        });
 
-                // Limit the length of outgoing calls.
-                let minutes = config::option_int(&self.config, "sip", "max_call_duration");
-                if minutes > 0 {
-                    println!("Maximale Anrufdauer: {} Minuten", minutes);
-                    self.start_call_duration_timer(minutes as u64 * 60);
-                }
-            }
+        // Nothing comes back from the other end while it is still
+        // ringing, so the caller hears the ringback until the call is
+        // answered or ends. Both stop it again.
+        self.audio.play_earpiece_tone(Tone::Freiton);
+
+        // Limit the length of outgoing calls.
+        let minutes = config::option_int(&self.config, "sip", "max_call_duration");
+        if minutes > 0 {
+            println!("Maximale Anrufdauer: {} Minuten", minutes);
+            self.start_call_duration_timer(minutes as u64 * 60);
         }
     }
 
     fn start_dial_timeout(self: &Arc<Self>) {
-        self.stop_dial_timeout();
         let seconds = config::option_int(&self.config, "sip", "dial_timeout");
         let phone = self.clone();
-        let handle = self.runtime.spawn(async move {
-            tokio::time::sleep(Duration::from_secs(seconds.max(0) as u64)).await;
-            phone.cancel_dialing();
-        });
-        *self.dial_timeout.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        self.dial_timeout.start(Duration::from_secs(seconds.max(0) as u64), move || phone.cancel_dialing());
     }
 
     fn stop_dial_timeout(&self) {
-        if let Some(handle) = self.dial_timeout.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            handle.abort();
-        }
+        self.dial_timeout.cancel();
     }
 
     fn start_call_duration_timer(self: &Arc<Self>, seconds: u64) {
-        if let Some(handle) = self.call_duration_timer.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            handle.abort();
-        }
         let phone = self.clone();
-        let handle = self.runtime.spawn(async move {
-            tokio::time::sleep(Duration::from_secs(seconds)).await;
-            phone.timeout_call();
-        });
-        *self.call_duration_timer.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        self.call_duration.start(Duration::from_secs(seconds), move || phone.timeout_call());
+    }
+
+    fn stop_call_duration_timer(&self) {
+        self.call_duration.cancel();
     }
 
     /// Give up dialling after the configured timeout.
     fn cancel_dialing(self: &Arc<Self>) {
         println!("Wählvorgang nach Timeout automatisch abgebrochen.");
-        self.dial_digits.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        lock(&self.dial_digits).clear();
         self.stop_dial_timeout();
         // Repeats, because there is nobody around to pick the handset up.
         self.audio.play_earpiece_tone(Tone::Besetzt);
@@ -428,15 +539,12 @@ impl Phone {
                 self.hang_up_incoming(CallDecision::Decline);
             }
 
-            self.dial_digits.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            lock(&self.dial_digits).clear();
             self.stop_dial_timeout();
             self.audio.stop_earpiece();
             self.send_command(SipCommand::Hangup);
             self.declined_incoming_call.store(false, Ordering::SeqCst);
-
-            if let Some(handle) = self.call_duration_timer.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                handle.abort();
-            }
+            self.stop_call_duration_timer();
         } else {
             println!("Hörer abgehoben");
 
@@ -455,7 +563,7 @@ impl Phone {
                 self.audio.play_earpiece_tone(Tone::NichtVerbunden);
             }
 
-            self.dial_digits.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            lock(&self.dial_digits).clear();
             self.start_dial_timeout();
         }
     }
@@ -532,24 +640,18 @@ impl Phone {
         self.audio.play_speaker_repeat(&self.ringtone_for(caller));
 
         // Hand the decision to the hook handler and give up after the ring timeout.
-        *self.pending_call.lock().unwrap_or_else(|e| e.into_inner()) = Some(reply);
+        *lock(&self.pending_call) = Some(reply);
         self.start_ring_timeout();
     }
 
     /// Give up on a call nobody picked up.
     fn start_ring_timeout(self: &Arc<Self>) {
         let phone = self.clone();
-        let handle = self.runtime.spawn(async move {
-            tokio::time::sleep(RING_TIMEOUT).await;
-            phone.ring_timeout();
-        });
-        *self.ring_timer.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        self.ring_timeout.start(RING_TIMEOUT, move || phone.ring_timeout());
     }
 
-    fn stop_ring_timeout(self: &Arc<Self>) {
-        if let Some(handle) = self.ring_timer.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            handle.abort();
-        }
+    fn stop_ring_timeout(&self) {
+        self.ring_timeout.cancel();
     }
 
     /// Nobody lifted the handset: stop ringing and let the call go.
@@ -560,7 +662,7 @@ impl Phone {
 
     /// Stop ringing and pass the decision to the SIP task.
     fn hang_up_incoming(self: &Arc<Self>, decision: CallDecision) {
-        let reply = self.pending_call.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let reply = lock(&self.pending_call).take();
         self.stop_ring_timeout();
         self.call_incoming.store(false, Ordering::SeqCst);
         self.audio.stop_speaker();
@@ -579,7 +681,9 @@ impl Phone {
 
 /// Is this caller listed in `[numbers]`, in any of the usual formats?
     fn is_known_caller(&self, caller: &str) -> bool {
-        let numbers: Vec<String> = self.numbers().into_iter().map(|(_, target)| target).collect();
+        let numbers: Vec<String> = self.numbers_table()
+            .map(|table| table.values().map(|v| v.to_display_string()).collect())
+            .unwrap_or_default();
         known_caller(caller, &numbers)
     }
 
@@ -590,7 +694,7 @@ impl Phone {
 
         let was_ringing = self.call_incoming.swap(false, Ordering::SeqCst);
         self.stop_ring_timeout();
-        *self.pending_call.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *lock(&self.pending_call) = None;
 
         // A call we already declined needs no further cleanup.
         if self.declined_incoming_call.swap(false, Ordering::SeqCst) {
@@ -598,10 +702,7 @@ impl Phone {
         }
 
         self.audio.stop_speaker();
-
-        if let Some(handle) = self.call_duration_timer.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            handle.abort();
-        }
+        self.stop_call_duration_timer();
 
         // The handset is off the cradle: it is waiting for the next number. The
         // tone repeats until the handset goes back down, so it does not run out
@@ -613,6 +714,17 @@ impl Phone {
 
     // ---------------------------------------------------------------- features
 
+    /// Is the night light lit, and with it the night or wake-up mode?
+    ///
+    /// The light is the state, because it is what the user sees and because the
+    /// two ways into the mode (night mode itself, and the wake-up light that
+    /// replaces it) are both just "the light is on". A timer is not the same
+    /// thing: night mode can be lit without one, when the wake-up times turn out
+    /// to be unusable.
+    fn night_mode_active(&self) -> bool {
+        self.led.night_light_on_state()
+    }
+
     /// Is do-not-disturb active, either on a timer or switched on manually?
     fn is_dnd_active(&self) -> bool {
         if self.manual_dnd.load(Ordering::SeqCst) {
@@ -621,7 +733,7 @@ impl Phone {
         let hour = Local::now().hour() as i64;
         let from = config::option_int(&self.config, "sip", "dnd_from");
         let to = config::option_int(&self.config, "sip", "dnd_to");
-        (0 < hour && hour <= to) || (0 < from && from <= hour)
+        dnd_window_active(hour, from, to)
     }
 
     /// Start or stop night mode.
@@ -638,13 +750,17 @@ impl Phone {
         self.led.wake_light_off();
 
         // Already in night mode or waking up: switch it off again.
-        let running = self.night_light_timer.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-        if running {
+        //
+        // The light itself is the state, not the timer: both error paths below
+        // switch the light on and *then* give up, so a run that never got as far
+        // as a timer would read as "not running" and could only ever switch the
+        // light on again - there was no way left to turn it off.
+        if self.night_mode_active() {
             println!("Deaktiviere Nacht-/Aufwachlicht.");
             self.cancel_night_timer();
             self.led.night_light_off();
             self.manual_dnd.store(false, Ordering::SeqCst);
-            *self.next_wake_up.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *lock(&self.next_wake_up) = None;
             return;
         }
 
@@ -663,21 +779,15 @@ impl Phone {
         };
 
         println!("Aktiviere Nachtlicht bis {}.", wake_up.format("%Y-%m-%d %H:%M"));
-        *self.next_wake_up.lock().unwrap_or_else(|e| e.into_inner()) = Some(wake_up);
+        *lock(&self.next_wake_up) = Some(wake_up);
 
         let seconds = seconds_until(wake_up);
         let phone = self.clone();
-        let handle = self.runtime.spawn(async move {
-            tokio::time::sleep(Duration::from_secs(seconds)).await;
-            phone.start_wakeup_light();
-        });
-        *self.night_light_timer.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        self.night_light.start(Duration::from_secs(seconds), move || phone.start_wakeup_light());
     }
 
     fn cancel_night_timer(&self) {
-        if let Some(handle) = self.night_light_timer.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            handle.abort();
-        }
+        self.night_light.cancel();
     }
 
     /// Turn the wake-up light on for two hours.
@@ -687,11 +797,7 @@ impl Phone {
         self.led.wake_light_on(None);
 
         let phone = self.clone();
-        let handle = self.runtime.spawn(async move {
-            tokio::time::sleep(Duration::from_secs(2 * 60 * 60)).await;
-            phone.stop_wakeup_light();
-        });
-        *self.night_light_timer.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        self.night_light.start(Duration::from_secs(2 * 60 * 60), move || phone.stop_wakeup_light());
     }
 
     fn stop_wakeup_light(self: &Arc<Self>) {
@@ -700,7 +806,7 @@ impl Phone {
         self.led.wake_light_off();
         self.cancel_night_timer();
         self.manual_dnd.store(false, Ordering::SeqCst);
-        *self.next_wake_up.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *lock(&self.next_wake_up) = None;
     }
 
     /// Start or stop the sleep music.
@@ -715,11 +821,11 @@ impl Phone {
         self.stop_sleep_music.store(false, Ordering::SeqCst);
         self.sleep_music_running.store(true, Ordering::SeqCst);
 
-        let phone = self.clone();
-        // Through the stored runtime handle: this is reached from the GPIO
-        // watcher thread, where a bare `spawn_blocking` has no reactor to
-        // attach to and panics.
-        self.runtime.spawn_blocking(move || phone.play_sleep_music());
+        // The music is played and waited for on a blocking task, so the dial
+        // thread goes on watching the hook switch: Through the stored runtime
+        // handle, because a bare `spawn_blocking` on that thread has no reactor
+        // to attach to and panics.
+        self.background(|phone| phone.play_sleep_music());
     }
 
     /// Play the sleep music; runs on a blocking thread because it waits for playback.
@@ -774,8 +880,7 @@ impl Phone {
         }
 
         // Do not disturb was only meant for the music.
-        let night_active = self.night_light_timer.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-        if !night_active {
+        if !self.night_mode_active() {
             self.manual_dnd.store(false, Ordering::SeqCst);
         }
 
@@ -821,19 +926,29 @@ impl Phone {
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         let host = config::option_str(&self.config, "network", "wifi_test_host");
+        let mut retry = NETWORK_RETRY_MIN;
 
         loop {
             if !reachable(&host).await {
                 if self.is_connected.swap(false, Ordering::SeqCst) {
                     println!("WLAN-Verbindung wurde getrennt.");
                     self.send_command(SipCommand::Shutdown);
-                    // Give the endpoint a moment to tear down before retrying.
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                } else {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
+
+                // The phone spends hours with no network at all, and it used to
+                // open a connection to look for one every second the whole time.
+                // The wait grows while nothing turns up and is back to its
+                // shortest the moment the network is there again, so a phone
+                // that is unplugged wakes a few times a minute rather than sixty
+                // times - at the price of up to `NETWORK_RETRY_MAX` seconds
+                // before a reconnect is noticed, which is nothing next to how
+                // long a session then needs to register.
+                tokio::time::sleep(retry).await;
+                retry = (retry * 2).min(NETWORK_RETRY_MAX);
                 continue;
             }
+
+            retry = NETWORK_RETRY_MIN;
 
             if !self.is_connected.swap(true, Ordering::SeqCst) {
                 println!("WLAN-Verbindung verfügbar.");
@@ -868,7 +983,7 @@ impl Phone {
         // The command receiver belongs to the phone, not to a session: it is handed
         // to the session for the duration of the call setup and given back
         // afterwards, so commands issued during a reconnect are not lost.
-        let commands = self.sip_receiver.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let commands = lock(&self.sip_receiver).take();
 
         let session = match commands {
             Some(commands) => self.runtime.spawn(async move { client.run(commands, events_tx).await }),
@@ -900,7 +1015,7 @@ impl Phone {
         };
 
         handler.abort();
-        *self.sip_receiver.lock().unwrap_or_else(|e| e.into_inner()) = Some(commands);
+        *lock(&self.sip_receiver) = Some(commands);
 
         result
     }
@@ -911,8 +1026,8 @@ impl Phone {
         sender: mpsc::Sender<SipCommand>,
         receiver: mpsc::Receiver<SipCommand>,
     ) {
-        *self.sip_commands.lock().unwrap_or_else(|e| e.into_inner()) = sender;
-        *self.sip_receiver.lock().unwrap_or_else(|e| e.into_inner()) = Some(receiver);
+        *lock(&self.sip_commands) = sender;
+        *lock(&self.sip_receiver) = Some(receiver);
     }
 
     /// Queue a command for the SIP task.
@@ -920,12 +1035,29 @@ impl Phone {
     /// Dropping it is not an error: the phone keeps working without a session,
     /// and the watchdog starts a new one when the network is back.
     fn send_command(&self, command: SipCommand) {
-        let sender = self.sip_commands.lock().unwrap_or_else(|e| e.into_inner());
+        let sender = lock(&self.sip_commands);
         if let Err(e) = sender.try_send(command) {
             if self.options.verbose {
                 println!("SIP-Befehl nicht zugestellt: {}", e);
             }
         }
+    }
+
+    /// Ask the SIP stack to end its session, and give it time to do so.
+    ///
+    /// Used on the way out. A `Shutdown` makes the session hang up and
+    /// unregister before it returns, which is what the other end needs: without
+    /// it the process simply stops, the RTP stream dries up and no BYE is sent,
+    /// so the caller only learns about the end from their own session timer -
+    /// which on a phone is long enough to be a noticeable stretch of dead air
+    /// with the handset still against their ear.
+    ///
+    /// How long the teardown takes is not observable from here, hence the wait.
+    /// A phone that is idle costs nothing: there is no session, the command sits
+    /// in the channel and the process exits when the wait is over.
+    pub async fn stop_sip(&self) {
+        self.send_command(SipCommand::Shutdown);
+        tokio::time::sleep(SHUTDOWN_GRACE).await;
     }
 }
 
@@ -937,31 +1069,13 @@ fn sip_bind_addr() -> std::net::SocketAddr {
 /// How long the phone rings before giving up on an incoming call.
 const RING_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Is `caller` among the configured numbers, in any of the usual spellings?
-///
-/// A caller is accepted if their own number is listed, or if the one other
-/// spelling we can derive from it is. The same German number reaches the phone
-/// as `0891234`, `+49891234` or `0049891234`, depending on the provider, and the
-/// user should not have to list all three.
-fn known_caller(caller: &str, configured: &[String]) -> bool {
-    let alternative = if let Some(rest) = caller.strip_prefix("00") {
-        // International format without plus sign: 0049891234 => +49891234
-        format!("+{}", rest)
-    } else if let Some(rest) = caller.strip_prefix('+') {
-        // International format with plus sign: +49891234 => 0049891234
-        format!("00{}", rest)
-    } else if let Some(rest) = caller.strip_prefix('0') {
-        // National format: 0891234 => +49891234. The country code is not
-        // configurable, so it is fixed here.
-        format!("+49{}", rest)
-    } else {
-        // Unknown format: no additional check.
-        String::new()
-    };
+/// How long the watchdog waits before looking for the network again, and how far
+/// that wait may grow while the network stays away.
+const NETWORK_RETRY_MIN: Duration = Duration::from_secs(1);
+const NETWORK_RETRY_MAX: Duration = Duration::from_secs(10);
 
-    configured.iter().any(|number| number == caller)
-        || (!alternative.is_empty() && configured.iter().any(|number| *number == alternative))
-}
+/// How long the SIP session is given to hang up and unregister on the way out.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(1000);
 
 /// Is a TCP connection to `host:80` possible? Used as the reachability check.
 async fn reachable(host: &str) -> bool {
@@ -987,217 +1101,8 @@ fn section_mut<'a>(config: &'a mut Table, name: &str) -> Option<&'a mut BTreeMap
     })
 }
 
-/// Next wake-up time: today if it is still ahead, otherwise tomorrow.
-///
-/// `times` holds one entry per weekday, Monday first. A week that is not
-/// complete is no schedule at all: without all seven days there is no next
-/// wake-up to report, whatever day of the week it happens to be.
-fn next_wake_up(times: &[String]) -> Option<chrono::NaiveDateTime> {
-    if times.len() != 7 {
-        return None;
-    }
-
-    let now = Local::now();
-    let today = now.date_naive();
-
-    let time_for = |date: chrono::NaiveDate| -> Option<NaiveTime> {
-        let index = date.weekday().num_days_from_monday() as usize;
-        times.get(index)?.parse::<NaiveTime>().ok()
-    };
-
-    if let Some(time) = time_for(today) {
-        let candidate = today.and_time(time);
-        if now.naive_local() < candidate {
-            return Some(candidate);
-        }
-    }
-
-    let tomorrow = today + chrono::Duration::days(1);
-    Some(tomorrow.and_time(time_for(tomorrow)?))
-}
-
-/// Seconds from now until the given moment, never negative.
-fn seconds_until(target: chrono::NaiveDateTime) -> u64 {
-    let now = Local::now().naive_local();
-    (target - now).num_seconds().max(0) as u64
-}
-
-// --------------------------------------------------------------------------------------
-// Web interface
-// --------------------------------------------------------------------------------------
-
-impl PhoneApi for Arc<Phone> {
-    fn get_state(&self) -> Json_ {
-        serde_json::json!({
-            "uptime": self.started_at.elapsed().as_secs(),
-            "connected": self.is_connected.load(Ordering::SeqCst),
-            "sip_registered": self.sip_registered.load(Ordering::SeqCst),
-            "call_active": self.call_up.load(Ordering::SeqCst),
-            "hungup": self.is_hungup(),
-            "night_light": self.led.night_light_on_state(),
-            "wake_up_mode": self.led.wake_light_on_state(),
-            "sleep_music": self.sleep_music_running.load(Ordering::SeqCst),
-            "dnd": self.is_dnd_active(),
-            // Full ISO 8601, because the page hands this to `new Date()`, and a
-            // bare "%H:%M" is not a parseable date. The date has to be in there
-            // too: the next wake-up may well be tomorrow, and the page shows the
-            // weekday.
-            "next_wake_up": self.next_wake_up
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .map(|t| t.format("%Y-%m-%dT%H:%M:%S").to_string()),
-            "config_changed": self.config_changed.load(Ordering::SeqCst),
-        })
-    }
-
-    fn get_config(&self) -> Json_ {
-        let baseline = self.baseline.lock().unwrap_or_else(|e| e.into_inner());
-        serde_json::json!({
-            "sections": config::describe(&baseline),
-            "mtime": *self.config_mtime.lock().unwrap_or_else(|e| e.into_inner()),
-            "restart_required": self.config_changed.load(Ordering::SeqCst),
-        })
-    }
-
-    fn save_config(&self, payload: Json_) -> Json_ {
-        // The form sends JSON, the file is TOML: convert, then run the same
-        // validation the file would go through.
-        let incoming = config::from_json(&payload);
-        let baseline = self.baseline.lock().unwrap_or_else(|e| e.into_inner()).clone();
-
-        let saved = match config::save(&self.options.config, &incoming, &baseline) {
-            Ok(saved) => saved,
-            Err(errors) => {
-                println!(
-                    "Konfiguration konnte nicht gespeichert werden: {}",
-                    errors.iter().map(|(_, m)| m).collect::<Vec<_>>().join(", ")
-                );
-                let map: serde_json::Map<String, Json_> = errors
-                    .iter()
-                    .map(|(key, message)| (key.to_string(), Json_::String(message.to_string())))
-                    .collect();
-                return serde_json::json!({ "ok": false, "errors": map });
-            }
-        };
-
-        let changed = saved.changed;
-        println!(
-            "Konfiguration gespeichert: {}",
-            if changed.is_empty() { "keine Änderungen".to_string() } else { changed.join(", ") }
-        );
-
-        *self.baseline.lock().unwrap_or_else(|e| e.into_inner()) = saved.cleaned;
-        *self.config_mtime.lock().unwrap_or_else(|e| e.into_inner()) =
-            modified(&self.options.config).unwrap_or(0.0);
-
-        // Ohne echte Änderung ist kein Neustart nötig.
-        let has_changes = !changed.is_empty();
-        if has_changes {
-            self.config_changed.store(true, Ordering::SeqCst);
-        }
-
-        serde_json::json!({ "ok": true, "changed": changed, "restart_required": has_changes })
-    }
-
-    fn run_action(&self, action: Action) {
-        match action {
-            Action::NightMode => self.start_night_mode(),
-            Action::SleepMusic => self.toggle_sleep_music(),
-            Action::TestLoudspeaker => self.test_loudspeaker(),
-            Action::TestEarpiece => self.test_earpiece(),
-            Action::Reboot => self.reboot(),
-            Action::Shutdown => self.shutdown(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn picks_todays_wake_up_when_still_ahead() {
-        let now = Local::now();
-        let later = now.format("%H:%M").to_string();
-        let times: Vec<String> = std::iter::repeat(later).take(7).collect();
-
-        match next_wake_up(&times) {
-            Some(target) => assert!(target >= now.naive_local()),
-            None => panic!("Uhrzeit sollte gültig sein"),
-        }
-    }
-
-    #[test]
-    fn moves_to_tomorrow_once_the_time_has_passed() {
-        let times: Vec<String> = std::iter::repeat("00:00".to_string()).take(7).collect();
-        let target = next_wake_up(&times).expect("gültige Uhrzeit");
-        assert!(target > Local::now().naive_local());
-    }
-
-    #[test]
-    fn rejects_incomplete_week() {
-        // Every length used to be accepted on most days, because only today
-        // and tomorrow were looked up: on a Sunday the Monday entry was still
-        // in a one-element week and hid the missing weekdays.
-        for len in [0, 1, 6, 8] {
-            let times: Vec<String> = std::iter::repeat("06:30".to_string()).take(len).collect();
-            assert!(next_wake_up(&times).is_none(), "{} Einträge sind keine Woche", len);
-        }
-    }
-
-    #[test]
-    fn seconds_until_is_never_negative() {
-        let past = Local::now().naive_local() - chrono::Duration::hours(1);
-        assert_eq!(seconds_until(past), 0);
-    }
-
-    /// The three spellings of a German number, as they arrive from a SIP server.
-    const NATIONAL: &str = "0891234";
-    const INTERNATIONAL: &str = "+49891234";
-    const INTERNATIONAL_PLAIN: &str = "0049891234";
-
-    fn known(caller: &str, configured: &[&str]) -> bool {
-        let owned: Vec<String> = configured.iter().map(|n| n.to_string()).collect();
-        known_caller(caller, &owned)
-    }
-
-    #[test]
-    fn whitelist_accepts_an_exact_number() {
-        assert!(known(NATIONAL, &[NATIONAL, INTERNATIONAL]));
-    }
-
-    #[test]
-    fn whitelist_accepts_the_derived_spelling() {
-        // Exactly one alternative is derived, and it depends on the caller's
-        // own format: 00 and + are each other's alternative, while the national
-        // format derives the international one.
-        assert!(known(NATIONAL, &[INTERNATIONAL]));
-        assert!(known(INTERNATIONAL, &[INTERNATIONAL_PLAIN]));
-        assert!(known(INTERNATIONAL_PLAIN, &[INTERNATIONAL]));
-    }
-
-    #[test]
-    fn whitelist_is_asymmetric_by_design() {
-        // Only one alternative is derived, so a caller in international format
-        // does not match a number stored nationally. Pinning this so the
-        // behaviour is a decision rather than an accident.
-        assert!(!known(INTERNATIONAL, &[NATIONAL]));
-        assert!(!known(INTERNATIONAL_PLAIN, &[NATIONAL]));
-    }
-
-    #[test]
-    fn whitelist_rejects_unknown_callers() {
-        assert!(!known("+49899999", &[NATIONAL, INTERNATIONAL]));
-        assert!(!known("12345", &[NATIONAL]));
-    }
-
-    #[test]
-    fn whitelist_rejects_everything_when_empty() {
-        for caller in [NATIONAL, INTERNATIONAL, INTERNATIONAL_PLAIN, "12345", ""] {
-            assert!(!known(caller, &[]), "{} dürfte nicht durchkommen", caller);
-        }
-    }
-
     /// Every feature here is triggered from the rotary dial, and the dial is
     /// decoded on the GPIO watcher thread — a plain OS thread with no reactor.
     /// A bare `tokio::spawn` or `spawn_blocking` on that path panics at runtime
@@ -1210,7 +1115,7 @@ mod tests {
         // harness, which does have a runtime; only the code above it runs on
         // the GPIO thread. Cutting here also keeps this test from matching the
         // patterns it searches for.
-        let source = include_str!("phone.rs")
+        let source = include_str!("mod.rs")
             .split("#[cfg(test)]")
             .next()
             .expect("Quelle vor den Tests");

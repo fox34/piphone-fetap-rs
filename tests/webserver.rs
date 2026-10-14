@@ -13,12 +13,13 @@ use serde_json::{json, Value as Json_};
 use tower::ServiceExt; // for `oneshot`
 
 use piphone::config;
-use piphone::webserver::{router, Action, PhoneApi};
+use piphone::command::Command;
+use piphone::webserver::{router, PhoneApi};
 
 /// A phone that only answers questions; nothing here touches hardware.
 struct StubPhone {
     saved: Mutex<Vec<config::Table>>,
-    actions: Mutex<Vec<Action>>,
+    actions: Mutex<Vec<Command>>,
 }
 
 impl StubPhone {
@@ -56,7 +57,7 @@ impl PhoneApi for StubPhone {
         json!({ "ok": true, "errors": {}, "changed": ["[sip]"] })
     }
 
-    fn run_action(&self, action: Action) {
+    fn run_action(&self, action: Command) {
         self.actions.lock().unwrap().push(action);
     }
 }
@@ -426,16 +427,11 @@ async fn rejects_unknown_actions_and_paths() {
 async fn triggers_the_configured_actions() {
     let client = Client::new();
 
-    for name in [
-        "night-mode",
-        "sleep-music",
-        "test-loudspeaker",
-        "test-earpiece",
-        "reboot",
-        "shutdown",
-    ] {
-        let (status, _, result) = client.post_action(name).await;
-        assert_eq!(status, StatusCode::OK, "Aktion {}", name);
+    // The action names come from the commands themselves: a new feature adds its
+    // web name where it is defined, and this covers it without being told.
+    for command in Command::ALL {
+        let (status, _, result) = client.post_action(command.web_name()).await;
+        assert_eq!(status, StatusCode::OK, "Aktion {}", command.web_name());
         assert_eq!(result["ok"], true);
     }
 }

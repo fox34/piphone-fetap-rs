@@ -117,6 +117,11 @@ async fn run(options: Options) -> Result<(), String> {
     // Wait for SIGTERM/SIGINT, then shut down cleanly.
     wait_for_termination().await;
 
+    // Let the SIP stack say goodbye before the process goes: a call that is up
+    // should end with a BYE and a cancelled registration rather than with the
+    // RTP simply stopping.
+    phone.stop_sip().await;
+
     println!("PiPhone beendet.");
     Ok(())
 }

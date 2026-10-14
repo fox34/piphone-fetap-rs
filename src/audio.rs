@@ -16,7 +16,9 @@
 //! on one of the async runtime's workers.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+
+use crate::sync::lock;
 
 /// ALSA device names, matching the `asound.conf` setup of the phone.
 const SPEAKER_DEVICE: &str = "i2s";
@@ -90,18 +92,18 @@ struct Done {
 impl Done {
     /// Mark the thread as finished and wake everyone waiting on it.
     fn finish(&self) {
-        *self.finished.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *lock(&self.finished) = true;
         self.signal.notify_all();
     }
 
     /// Has the thread finished?
     fn is_finished(&self) -> bool {
-        *self.finished.lock().unwrap_or_else(|e| e.into_inner())
+        *lock(&self.finished)
     }
 
     /// Block until the thread has finished.
     fn wait(&self) {
-        let mut finished = self.finished.lock().unwrap_or_else(|e| e.into_inner());
+        let mut finished = lock(&self.finished);
         while !*finished {
             finished = self.signal.wait(finished).unwrap_or_else(|e| e.into_inner());
         }
@@ -144,7 +146,7 @@ impl Channel {
     where
         F: FnOnce(&AtomicBool) -> Result<(), String> + Send + 'static,
     {
-        let _gate = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let _gate = lock(&self.gate);
         self.stop();
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -171,7 +173,7 @@ impl Channel {
 
         match result {
             Ok(_) => {
-                *self.playback.lock().unwrap_or_else(|e| e.into_inner()) =
+                *lock(&self.playback) =
                     Some(Playback { stop, done });
             }
             Err(e) => println!("Klang {} konnte nicht gestartet werden: {}", what, e),
@@ -183,14 +185,14 @@ impl Channel {
         // Take the playback out before signalling it: waiting for the thread
         // below must not hold the lock, or `wait` could never see the thread
         // finish.
-        let playback = self.playback.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let playback = lock(&self.playback).take();
         if let Some(playback) = playback {
             playback.stop.store(true, Ordering::SeqCst);
             // Wait for the thread to release the sound card before returning. A
             // caller that starts the next sound straight away must not race the
             // old stream for the device. The thread signals once it is done,
             // which is as soon as its current ALSA write returns.
-            playback.join();
+            playback.done.wait();
         }
     }
 
@@ -201,7 +203,7 @@ impl Channel {
     /// short - that is how lifting the handset stops the sleep music.
     pub fn wait(&self) {
         let done = {
-            let slot = self.playback.lock().unwrap_or_else(|e| e.into_inner());
+            let slot = lock(&self.playback);
             // `None` means nothing is playing, or another thread already stopped
             // and reaped it.
             match slot.as_ref() {
@@ -218,18 +220,11 @@ impl Channel {
     /// The finished flag is checked as well as the slot: a sound that ran to its
     /// end is over even though nobody has taken it out of the channel yet.
     pub fn is_playing(&self) -> bool {
-        let slot = self.playback.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = lock(&self.playback);
         match slot.as_ref() {
             None => false,
             Some(playback) => !playback.done.is_finished(),
         }
-    }
-}
-
-impl Playback {
-    /// Block until the playback thread has released the sound card.
-    fn join(&self) {
-        self.done.wait();
     }
 }
 
@@ -310,6 +305,11 @@ fn play(path: &str, device: &str, repeat: bool, stop: &AtomicBool) -> Result<(),
     // The silence between two rings, appended after every pass.
     let gap = silence(rate, channels as u32);
 
+    // One buffer for the whole sound: the decoder hands over a packet at a time,
+    // and a fresh `Vec` per packet is an allocation per few milliseconds for as
+    // long as the sound plays.
+    let mut converted: Vec<i16> = Vec::new();
+
     loop {
         // Decode and write one pass over the file.
         let mut failure = None;
@@ -331,7 +331,7 @@ fn play(path: &str, device: &str, repeat: bool, stop: &AtomicBool) -> Result<(),
 
             match decoder.decode(&packet) {
                 Ok(decoded) => {
-                    if write(&io, &decoded, channels).is_err() {
+                    if write(&io, &decoded, channels, &mut converted).is_err() {
                         // The stream is gone. Give up on the sound entirely
                         // rather than fall through to the next repeat, which
                         // would spin on an already empty file.
@@ -374,6 +374,12 @@ fn play(path: &str, device: &str, repeat: bool, stop: &AtomicBool) -> Result<(),
 /// but it would also make `stop` wait out the rest of a long track, which is
 /// exactly what lifting the handset must not do. So it waits in short slices and
 /// bails on the stop request.
+///
+/// Only ever called from [`play`], which is Linux-only - but it takes an
+/// `alsa::pcm::PCM`, so it has to be gated with it. Ungated, it was the one thing
+/// in this module that stopped the crate from compiling off-target, which is
+/// where the tests and the web page tests are supposed to run.
+#[cfg(target_os = "linux")]
 fn drain(pcm: &alsa::pcm::PCM, stop: &AtomicBool) -> Result<(), String> {
     // How long to wait per slice. Short enough that a stop request feels
     // immediate, long enough not to spin.
@@ -413,20 +419,27 @@ fn drain(pcm: &alsa::pcm::PCM, stop: &AtomicBool) -> Result<(), String> {
 
 /// Hand one decoded buffer to ALSA as interleaved i16.
 #[cfg(target_os = "linux")]
+/// Hand one decoded buffer to ALSA as interleaved i16, through `converted`.
+///
+/// `converted` is refilled rather than reallocated: it is the same buffer for
+/// every packet of the sound, so a pass over a file costs one allocation
+/// instead of one per packet.
+#[cfg(target_os = "linux")]
 fn write(
     io: &alsa::pcm::IO<i16>,
     decoded: &symphonia::core::audio::GenericAudioBufferRef<'_>,
     channels: usize,
+    converted: &mut Vec<i16>,
 ) -> Result<(), ()> {
     // The destination has to be exactly the right length, so it is sized from the
     // decoded buffer rather than merely given capacity.
-    let mut samples = vec![0i16; decoded.samples_interleaved()];
+    converted.resize(decoded.samples_interleaved(), 0);
     // `copy_to_slice_interleaved` converts the decoded sample format to i16 and
-    // interleaves the planes in one step, so MP3 and 32-bit WAV both land in
-    // the right shape.
-    decoded.slice(..).copy_to_slice_interleaved::<i16, _>(&mut samples);
+    // interleaves the planes in one step, so MP3 and 32-bit WAV both land in the
+    // right shape.
+    decoded.slice(..).copy_to_slice_interleaved::<i16, _>(&mut converted[..]);
 
-    write_samples(io, &samples, channels)
+    write_samples(io, &converted[..], channels)
 }
 
 /// Hand interleaved i16 to ALSA, blocking until it is accepted.
@@ -617,8 +630,29 @@ impl Tone {
     ///
     /// The caller loops this: every tone here is meant to run on until the
     /// phone stops it.
-    fn samples(self) -> Vec<i16> {
-        self.steps().iter().flat_map(|step| step.samples()).collect()
+    ///
+    /// Rendered once per tone and then reused. A pass is up to 240 000 samples
+    /// of sine - the ringback runs five seconds - and it used to be built from
+    /// scratch on every start, which is once per dial tone. The tones do not
+    /// change while the phone runs, so there is nothing to be gained by building
+    /// them twice.
+    fn samples(self) -> &'static [i16] {
+        // One cell per tone, so each gets its own.
+        static FREI: OnceLock<Vec<i16>> = OnceLock::new();
+        static BESETZT: OnceLock<Vec<i16>> = OnceLock::new();
+        static FREITON: OnceLock<Vec<i16>> = OnceLock::new();
+        static UNGUELTIG: OnceLock<Vec<i16>> = OnceLock::new();
+        static NICHT_VERBUNDEN: OnceLock<Vec<i16>> = OnceLock::new();
+
+        let cell = match self {
+            Tone::Frei => &FREI,
+            Tone::Besetzt => &BESETZT,
+            Tone::Freiton => &FREITON,
+            Tone::Ungueltig => &UNGUELTIG,
+            Tone::NichtVerbunden => &NICHT_VERBUNDEN,
+        };
+
+        cell.get_or_init(|| self.steps().iter().flat_map(|step| step.samples()).collect())
     }
 }
 
@@ -643,6 +677,11 @@ fn fade(frame: usize, frames: usize) -> f64 {
 /// shape, so the `plug:` wrapper does the same rate and channel conversion.
 #[cfg(target_os = "linux")]
 fn play_tone(tone: Tone, device: &str, stop: &AtomicBool) -> Result<(), String> {
+    // Asked for before the card is opened. Building a tone is a lot of sine, and
+    // a stream that is already running with nothing queued to play is a silence
+    // at the start of every dial tone.
+    let samples = tone.samples();
+
     let pcm = alsa::pcm::PCM::new(&format!("plug:{}", device), alsa::Direction::Playback, false)
         .map_err(|e| format!("Gerät \"{}\" nicht verfügbar: {}", device, e))?;
 
@@ -652,7 +691,6 @@ fn play_tone(tone: Tone, device: &str, stop: &AtomicBool) -> Result<(), String> 
     pcm.start().map_err(|e| format!("Wiedergabe nicht startbar: {}", e))?;
 
     let io = pcm.io_i16().map_err(|e| format!("Wiedergabe-Format falsch: {}", e))?;
-    let samples = tone.samples();
 
     // The sequence repeats for as long as the phone wants the tone, and is
     // written in short slices so a stop request does not have to wait out a
@@ -791,7 +829,7 @@ mod tests {
     fn fake_sound(channel: &Channel) -> (Arc<AtomicBool>, Arc<Done>) {
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(Done::default());
-        *channel.playback.lock().unwrap_or_else(|e| e.into_inner()) =
+        *lock(&channel.playback) =
             Some(Playback { stop: stop.clone(), done: done.clone() });
         (stop, done)
     }

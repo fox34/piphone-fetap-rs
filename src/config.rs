@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::LazyLock;
 use toml::Value as Toml;
 
@@ -153,16 +154,6 @@ pub fn to_json(value: &Val) -> Json {
 // --------------------------------------------------------------------------------------------
 // Schema
 // --------------------------------------------------------------------------------------------
-
-/// Kurzbefehle, die in `[numbers]` als Ziel einer Kurzwahl stehen dürfen.
-pub const COMMANDS: [&str; 6] = [
-    "shutdown",
-    "reboot",
-    "enable-night-mode",
-    "play-sleep-music",
-    "test-loudspeaker",
-    "test-earpiece",
-];
 
 /// Wie viele Ziffern eine Kurzwahl höchstens haben darf (längere Folgen bricht der Nummernschalter ab).
 pub const MAX_DIAL_CODE: usize = 5;
@@ -416,7 +407,7 @@ pub static SECTIONS: LazyLock<Vec<SectionSpec>> = LazyLock::new(|| {
                 value_pattern: Some(PHONE_PATTERN),
                 key_message: DIAL_CODE_MESSAGE,
                 value_message: "Rufnummer angeben oder einen der Kurzbefehle wählen.",
-                choices: &COMMANDS,
+                choices: &crate::command::DIAL_NAMES,
             }),
         },
         SectionSpec {
@@ -721,30 +712,31 @@ pub fn dump(data: &Table) -> String {
 // Lesen
 // --------------------------------------------------------------------------------------------
 
+/// Fehler beim Lesen der Konfigurationsdatei.
+///
+/// Datei und Inhalt hadern nichts miteinander zu tun - die Datei ist entweder
+/// nicht da oder kein gültiges TOML - deshalb ein einziger Typ mit dem Grund als
+/// Text. Das ist genau das, was angezeigt wird.
 #[derive(Debug)]
-pub enum ConfigError {
-    Io(std::io::Error),
-    Toml(String),
-}
+pub struct ConfigError(String);
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ConfigError::Io(e) => write!(f, "{}", e),
-            ConfigError::Toml(e) => write!(f, "{}", e),
-        }
+        write!(f, "{}", self.0)
     }
 }
 
+impl std::error::Error for ConfigError {}
+
 impl From<std::io::Error> for ConfigError {
     fn from(value: std::io::Error) -> Self {
-        ConfigError::Io(value)
+        ConfigError(value.to_string())
     }
 }
 
 impl From<toml::de::Error> for ConfigError {
     fn from(value: toml::de::Error) -> Self {
-        ConfigError::Toml(value.to_string())
+        ConfigError(value.to_string())
     }
 }
 
@@ -760,10 +752,21 @@ pub fn read(path: &Path) -> Result<Table, ConfigError> {
 }
 
 /// Pfad der temporären Datei, über die geschrieben wird.
+///
+/// Der Name ist einmalig, damit zwei Speichervorgänge sich nicht ins Gehege
+/// kommen: Die Zieldatei wird erst am Ende ersetzt, und zwei gleichnamige
+/// temporäre Dateien würden sich gegenseitig die Kontrolldatei wegschnappen und
+/// am Ende eine von beiden halb geschrieben stehen lassen.
 fn temporary_path(path: &Path) -> std::path::PathBuf {
-    let mut name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    name.push_str(".tmp");
-    path.with_file_name(name)
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    // Einer für den Prozess, einer für den Aufruf: die echte Datei wird erst ganz
+    // am Ende ersetzt, und zwei gleichnamige temporäre Dateien würden sich
+    // gegenseitig die Kontrolldatei wegschnappen und eine davon halb geschrieben
+    // zurücklassen. Zwei Tabs im Browser genügen, um das auszulösen.
+    let unique = format!("{}.{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    path.with_file_name(format!("{name}.{unique}.tmp"))
 }
 
 /// Ergebnis eines Speichervorgangs.
@@ -937,7 +940,7 @@ fn coerce(option: &OptionSpec, raw: Option<&Val>) -> Result<Val, String> {
     };
 
     // Grenzwerte nur für Zahlen
-    if let (Val::Int(_) | Val::Float(_), true) = (&value, true) {
+    if let Val::Int(_) | Val::Float(_) = &value {
         let number = match &value {
             Val::Int(i) => *i as f64,
             Val::Float(f) => *f,

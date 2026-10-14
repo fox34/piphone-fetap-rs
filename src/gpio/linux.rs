@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use gpiod::{AsValuesMut, Bias, Chip, Edge, EdgeDetect, Lines, Masked, Options};
 
 use super::Change;
+use crate::sync::lock;
 
 /// Consumer name shown in `/sys/kernel/debug/gpio` while the phone runs.
 const CONSUMER: &str = "piphone";
@@ -138,7 +139,7 @@ fn read_edges(
 
         // The wiring tests only ask for levels, so the cache has to follow the
         // stream even when nobody is waiting for changes.
-        if let Some(level) = levels.lock().unwrap_or_else(|e| e.into_inner()).low.get_mut(change.index)
+        if let Some(level) = lock(&levels).low.get_mut(change.index)
         {
             *level = change.low;
         }
@@ -165,7 +166,7 @@ impl Inputs {
     /// An unknown line counts as open, so a broken contact cannot make the
     /// phone believe a call was answered.
     pub fn is_low(&self, index: usize) -> bool {
-        self.levels.lock().unwrap_or_else(|e| e.into_inner()).low.get(index).copied().unwrap_or(false)
+        lock(&self.levels).low.get(index).copied().unwrap_or(false)
     }
 
     /// Wait up to `timeout` for level changes, and return them in the order the

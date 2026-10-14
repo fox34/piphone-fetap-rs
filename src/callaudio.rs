@@ -12,7 +12,10 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::Notify;
+
 use crate::sip::AudioBridge;
+use crate::sync::lock;
 
 /// G.711 in SIP runs at 8 kHz mono with 20 ms frames.
 pub const RATE: u32 = crate::sip::SAMPLE_RATE;
@@ -105,7 +108,7 @@ impl CallAudio {
     ///
     /// Cheap when nobody holds it, so it can be called on every end of a call.
     pub fn release(&self) {
-        let bridge = self.bridge.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let bridge = lock(&self.bridge).take();
         // Outside the lock: stopping a bridge waits for its ALSA threads.
         if let Some(bridge) = bridge {
             bridge.stop();
@@ -115,11 +118,7 @@ impl CallAudio {
     /// Register the bridge of the call that is up, which is to say: the card is
     /// taken from here on.
     pub fn hold(&self, bridge: Arc<dyn AudioBridge>) {
-        let previous = self
-            .bridge
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replace(bridge);
+        let previous = lock(&self.bridge).replace(bridge);
         drop(previous);
     }
 }
@@ -140,30 +139,56 @@ impl AudioBridge for NullBridge {
 /// Ring buffer shared between an ALSA thread and the async SIP pump.
 pub struct RingBuffer {
     inner: Mutex<VecDeque<Vec<i16>>>,
+    /// Fires when a frame is pushed.
+    ///
+    /// The consumer on the other side has to stay in step with a 20 ms frame
+    /// clock. Looking for a frame in a loop would either burn a core, or - at a
+    /// sane interval - add most of a frame of delay to every frame that arrives
+    /// just after a look, and that is the caller's own voice. Being told that
+    /// something arrived costs one atomic flag and no waiting at all.
+    arrived: Arc<Notify>,
 }
 
 impl RingBuffer {
     pub fn new() -> Self {
-        RingBuffer { inner: Mutex::new(VecDeque::with_capacity(QUEUE_DEPTH)) }
+        RingBuffer {
+            inner: Mutex::new(VecDeque::with_capacity(QUEUE_DEPTH)),
+            arrived: Arc::new(Notify::new()),
+        }
     }
 
     /// Append a frame, dropping the oldest one once the queue is full.
     pub fn push(&self, samples: Vec<i16>) {
-        let mut queue = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut queue = lock(&self.inner);
         if queue.len() >= QUEUE_DEPTH {
             queue.pop_front();
         }
         queue.push_back(samples);
+        drop(queue);
+
+        // Woken after the lock is released: a waiter takes the lock itself, and
+        // `notify_one` keeps a permit for the case where nobody is waiting yet.
+        self.arrived.notify_one();
     }
 
     /// Take the oldest frame, if any.
     pub fn pop(&self) -> Option<Vec<i16>> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+        lock(&self.inner).pop_front()
+    }
+
+    /// A handle the consumer can wait on to learn that a frame has arrived.
+    ///
+    /// `Notify` keeps a permit when it is notified with nobody waiting, so a
+    /// frame that arrives between the consumer's last [`Self::pop`] and its
+    /// first wait is not lost - that gap is where the frame would otherwise go
+    /// missing and the consumer would sit out a whole frame time.
+    pub fn arrivals(&self) -> Arc<Notify> {
+        self.arrived.clone()
     }
 
     /// Is the buffer empty?
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        lock(&self.inner).is_empty()
     }
 }
 
@@ -176,7 +201,10 @@ pub mod alsa {
     use std::thread;
     use std::time::Duration;
 
+    use tokio::sync::Notify;
+
     use crate::sip::AudioBridge;
+    use crate::sync::lock;
 
     /// Playback and capture on the USB sound card.
     pub struct UsbBridge {
@@ -249,7 +277,7 @@ pub mod alsa {
         /// Idempotent, and safe to call from [`Drop`].
         pub fn stop(&self) {
             self.active.store(false, Ordering::SeqCst);
-            for thread in self.threads.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            for thread in lock(&self.threads).drain(..) {
                 // The threads own the streams and close them on their way out.
                 let _ = thread.join();
             }
@@ -270,12 +298,27 @@ pub mod alsa {
                             return;
                         }
                     };
-                    let silence = vec![0i16; FRAME];
+                    let mut samples = vec![0i16; FRAME];
 
                     while active.load(Ordering::SeqCst) {
-                        // Feed silence when idle so the card keeps running and
-                        // the earpiece does not click between frames.
-                        let samples = queue.pop().unwrap_or_else(|| silence.clone());
+                        // One buffer for the whole call, refilled on every pass:
+                        // this runs fifty times a second for as long as the call
+                        // lasts, and it used to be a `Vec` allocation per pass.
+                        // `resize` rather than `copy_from_slice`, because a frame
+                        // off the wire is not guaranteed to be one frame long and
+                        // must not panic this thread over it.
+                        match queue.pop() {
+                            Some(received) => {
+                                samples.clear();
+                                samples.extend_from_slice(&received);
+                            }
+                            // Silence when idle, so the card keeps running and
+                            // the earpiece does not click between frames.
+                            None => {
+                                samples.clear();
+                                samples.resize(FRAME, 0);
+                            }
+                        }
                         if let Err(e) = io.writei(&samples) {
                             eprintln!("Wiedergabe fehlgeschlagen: {}", e);
                             active.store(false, Ordering::SeqCst);
@@ -326,7 +369,7 @@ pub mod alsa {
 
         /// Keep a thread so [`UsbBridge::stop`] can wait for it.
         fn remember_thread(&self, thread: std::thread::JoinHandle<()>) {
-            self.threads.lock().unwrap_or_else(|e| e.into_inner()).push(thread);
+            lock(&self.threads).push(thread);
         }
     }
 
@@ -347,6 +390,11 @@ pub mod alsa {
         /// Samples from the microphone, for the next RTP frame.
         fn take_speaker(&self) -> Option<Vec<i16>> {
             self.capture.pop()
+        }
+
+        /// The SIP pump can be woken when the microphone produced something.
+        fn arrivals(&self) -> Option<Arc<Notify>> {
+            Some(self.capture.arrivals())
         }
 
         /// Hand the card back, rather than waiting for the last drop: the phone
@@ -402,6 +450,26 @@ pub fn open_bridge(device: &str) -> Arc<dyn AudioBridge> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn arriving_frames_wake_a_waiter() {
+        let runtime = tokio::runtime::Runtime::new().expect("Laufzeitumgebung");
+        runtime.block_on(async {
+            let buffer = RingBuffer::new();
+            let arrived = buffer.arrivals();
+
+            // A frame that arrives before anybody waits must not be lost. The
+            // pump looks in the buffer first and only then waits, and that gap
+            // is exactly where a frame would disappear - the pump would then sit
+            // out a whole frame time before noticing it.
+            buffer.push(vec![1, 2, 3]);
+            let woken = tokio::time::timeout(Duration::from_millis(100), arrived.notified()).await;
+            assert!(woken.is_ok(), "eine bereits angekommene Frame muss wecken");
+
+            assert_eq!(buffer.pop(), Some(vec![1, 2, 3]));
+        });
+    }
 
     #[test]
     fn ring_buffer_drops_oldest_when_full() {

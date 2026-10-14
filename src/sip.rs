@@ -11,7 +11,7 @@
 //! so the phone logic stays independent of the SIP library.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rvoip::sip::{
@@ -21,6 +21,7 @@ use rvoip::sip::{
 
 use crate::callaudio;
 use crate::phone::SipCommand;
+use crate::sync::lock;
 
 /// G.711 in SIP runs at 8 kHz; frames are 20 ms.
 pub const SAMPLE_RATE: u32 = 8_000;
@@ -89,6 +90,15 @@ pub trait AudioBridge: Send + Sync {
     fn push_microphone(&self, samples: Vec<i16>);
     /// Take received samples for playback on the earpiece.
     fn take_speaker(&self) -> Option<Vec<i16>>;
+    /// A notifier that fires when [`Self::take_speaker`] has something to give.
+    ///
+    /// The pump waits on this instead of looking for a frame in a loop, which
+    /// would otherwise add up to a whole frame of delay to the caller's own
+    /// voice. A bridge that never produces samples - the null one - leaves it
+    /// out, and the pump falls back to waiting out the frame clock.
+    fn arrivals(&self) -> Option<Arc<tokio::sync::Notify>> {
+        None
+    }
     /// Sample rate the bridge runs at.
     fn sample_rate(&self) -> u32 {
         SAMPLE_RATE
@@ -168,6 +178,33 @@ pub fn call_target(number: &str, host: &str) -> String {
     format!("sip:{}@{}", number, host)
 }
 
+/// The state that the SIP loop, an incoming call's task and the audio pump all
+/// act on the same call with.
+///
+/// These cannot be three sets of copies. The sound card in particular has to be
+/// taken and given back through the *same* place, or the busy tone after a call
+/// races the conversation it follows - see [`callaudio::CallAudio`]. One handle
+/// behind them all says that plainly, and leaves the incoming-call task with
+/// three fields instead of seven.
+struct Shared {
+    /// Handle of the call currently up, so it can be hung up on request.
+    current_call: Mutex<Option<EndpointCall>>,
+    /// Is a call currently up?
+    call_active: AtomicBool,
+    /// Who holds the sound card, so it can be given back when the call ends.
+    call_audio: Arc<callaudio::CallAudio>,
+    /// Whether the current call already has its bridge.
+    ///
+    /// An answered incoming call gets its bridge as part of answering, so the
+    /// phone's go-ahead must not start a second one - the card is only good for
+    /// one, and the loser of that race would take the audio away from the
+    /// conversation that is already running on it.
+    call_audio_started: AtomicBool,
+    /// ALSA device for call audio, opened per call rather than held open.
+    audio_device: &'static str,
+    verbose: bool,
+}
+
 /// A running SIP endpoint.
 pub struct SipClient {
     /// Command half of the endpoint. Cloneable, so every task can share it.
@@ -180,20 +217,7 @@ pub struct SipClient {
     /// observation arrive unusable — `answer()` fails with "session not
     /// found". Only the stream from `split()` carries the handle.
     stream: EndpointEvents,
-    call_active: Arc<AtomicBool>,
-    /// Handle of the call currently up, so it can be hung up on request.
-    current_call: Arc<std::sync::Mutex<Option<EndpointCall>>>,
-    /// ALSA device for call audio, opened per call rather than held open.
-    audio_device: &'static str,
-    /// Who holds the sound card, so it can be given back when the call ends.
-    call_audio: Arc<callaudio::CallAudio>,
-    /// Whether the current call already has its bridge.
-    ///
-    /// An answered incoming call gets its bridge as part of answering, so the
-    /// phone's go-ahead must not start a second one - the card is only good for
-    /// one, and the loser of that race would take the audio away from the
-    /// conversation that is already running on it.
-    call_audio_started: Arc<AtomicBool>,
+    shared: Arc<Shared>,
     /// Identifier of the outgoing call we placed, if any.
     ///
     /// The `CallAnswered` event carries an `EndpointCall` built from a handle
@@ -201,8 +225,7 @@ pub struct SipClient {
     /// `audio()` then refuses it with "session not found". Wrapping the id
     /// again with [`Endpoint::wrap_call`] produces a handle from the current
     /// state, which is what the outgoing path has to use.
-    outgoing_id: std::sync::Mutex<Option<CallId>>,
-    verbose: bool,
+    outgoing_id: Mutex<Option<CallId>>,
 }
 
 impl SipClient {
@@ -252,25 +275,27 @@ impl SipClient {
             // only source of incoming calls that can actually be answered.
             control,
             stream,
-            call_active: Arc::new(AtomicBool::new(false)),
-            current_call: Arc::new(std::sync::Mutex::new(None)),
-            audio_device,
-            call_audio: Arc::new(callaudio::CallAudio::default()),
-            call_audio_started: Arc::new(AtomicBool::new(false)),
-            outgoing_id: std::sync::Mutex::new(None),
-            verbose,
+            shared: Arc::new(Shared {
+                current_call: Mutex::new(None),
+                call_active: AtomicBool::new(false),
+                call_audio: Arc::new(callaudio::CallAudio::default()),
+                call_audio_started: AtomicBool::new(false),
+                audio_device,
+                verbose,
+            }),
+            outgoing_id: Mutex::new(None),
         })
     }
 
     /// Whether a call is currently up.
     pub fn call_active(&self) -> bool {
-        self.call_active.load(Ordering::SeqCst)
+        self.shared.call_active.load(Ordering::SeqCst)
     }
 
     /// Place an outgoing call to a number.
     pub async fn call(&self, number: &str, host: &str) -> Result<(), SipError> {
         let target = call_target(number, host);
-        if self.verbose {
+        if self.shared.verbose {
             match self.control.resolve_target(&target) {
                 Ok(resolved) if resolved != target => {
                     println!("--> SIP: rufe {} an (normalisiert zu {})", target, resolved)
@@ -290,8 +315,8 @@ impl SipClient {
             .await
             .map_err(|e| SipError(format!("Anruf {} nicht möglich: {}", target, explain(&e))))?;
 
-        *self.outgoing_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(call_id);
-        self.call_active.store(true, Ordering::SeqCst);
+        *lock(&self.outgoing_id) = Some(call_id);
+        self.shared.call_active.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -309,11 +334,12 @@ impl SipClient {
     /// exactly what a busy tone is for. This blocks for at most the length of
     /// one audio buffer while the ALSA threads let go.
     fn forget_call(&self) {
-        *self.current_call.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.outgoing_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        self.call_active.store(false, Ordering::SeqCst);
-        self.call_audio_started.store(false, Ordering::SeqCst);
-        self.call_audio.release();
+        let shared = &self.shared;
+        *lock(&shared.current_call) = None;
+        *lock(&self.outgoing_id) = None;
+        shared.call_active.store(false, Ordering::SeqCst);
+        shared.call_audio_started.store(false, Ordering::SeqCst);
+        shared.call_audio.release();
     }
 
     /// Remember a call as the current one, without touching the sound card.
@@ -321,13 +347,13 @@ impl SipClient {
     /// For a call we placed, the handle is rebuilt from the stored id; for an
     /// answered incoming call the one from `answer()` is authoritative already.
     fn remember_call(&self, call: &EndpointCall) {
-        let handle = match self.outgoing_id.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let handle = match lock(&self.outgoing_id).take() {
             Some(id) => self.control.wrap_call(id),
             None => call.clone(),
         };
 
-        *self.current_call.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
-        self.call_active.store(true, Ordering::SeqCst);
+        *lock(&self.shared.current_call) = Some(handle);
+        self.shared.call_active.store(true, Ordering::SeqCst);
     }
 
     /// Open the sound card for the call that is up.
@@ -339,41 +365,38 @@ impl SipClient {
     /// that is busy. Ignored if the call is already over, or if a bridge is
     /// running already.
     fn start_call_audio(&self) {
-        if self.call_audio_started.swap(true, Ordering::SeqCst) {
+        let shared = &self.shared;
+        if shared.call_audio_started.swap(true, Ordering::SeqCst) {
             return;
         }
 
-        let call = self.current_call.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let call = lock(&shared.current_call).clone();
         let Some(call) = call else {
             // The call ended before the phone got round to opening the card.
-            self.call_audio_started.store(false, Ordering::SeqCst);
+            shared.call_audio_started.store(false, Ordering::SeqCst);
             return;
         };
 
-        callaudio::start(call, self.audio_device, self.verbose, self.call_audio.clone());
+        callaudio::start(call, shared.audio_device, shared.verbose, shared.call_audio.clone());
     }
 
     /// End the current call, if there is one.
     pub async fn hangup(&self) {
-        let answered = self.current_call.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let shared = &self.shared;
+        let answered = lock(&shared.current_call).take();
 
         // A call that is still ringing has no answered handle yet, but it still
         // has to be cancelled: without this the other end keeps ringing long
         // after the handset goes back on the cradle.
         let call = match answered {
             Some(call) => Some(call),
-            None => self
-                .outgoing_id
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-                .map(|id| self.control.wrap_call(id)),
+            None => lock(&self.outgoing_id).take().map(|id| self.control.wrap_call(id)),
         };
-        self.call_active.store(false, Ordering::SeqCst);
+        shared.call_active.store(false, Ordering::SeqCst);
 
         let Some(call) = call else { return };
         if let Err(e) = call.hangup().await {
-            if self.verbose {
+            if self.shared.verbose {
                 println!("SIP: Auflegen fehlgeschlagen: {}", e);
             }
         }
@@ -408,7 +431,7 @@ impl SipClient {
         // to nobody.
         match self.control.register().await {
             Ok(_) => {
-                if self.verbose {
+                if self.shared.verbose {
                     println!("<-- SIP: REGISTER gesendet");
                 }
             }
@@ -472,20 +495,10 @@ impl SipClient {
                 // Each ringing call gets its own task. Answering waits on a
                 // human, and the SIP loop has to stay free to see the caller
                 // hang up while the handset is still on the cradle.
-                let shared = IncomingCall {
-                    incoming,
-                    events: events.clone(),
-                    current_call: self.current_call.clone(),
-                    call_active: self.call_active.clone(),
-                    call_audio: self.call_audio.clone(),
-                    call_audio_started: self.call_audio_started.clone(),
-                    audio_device: self.audio_device,
-                    verbose: self.verbose,
-                };
-                tokio::spawn(shared.serve());
+                tokio::spawn(IncomingCall { incoming, events: events.clone(), shared: self.shared.clone() }.serve());
             }
             EndpointEvent::CallAnswered { call, .. } => {
-                if self.verbose {
+                if self.shared.verbose {
                     println!("<-- SIP: Anruf angenommen, Gespräch läuft");
                 }
                 // Only remembered here: the phone opens the sound card once it
@@ -494,7 +507,7 @@ impl SipClient {
                 let _ = events.send(SipEvent::CallAnswered).await;
             }
             EndpointEvent::CallProgress { status_code, reason, has_sdp, .. } => {
-                if self.verbose {
+                if self.shared.verbose {
                     println!("<-- SIP: Anruf im Aufbau, {} {} (SDP: {})", status_code, reason, has_sdp);
                 }
             }
@@ -504,7 +517,7 @@ impl SipClient {
                 let _ = events.send(SipEvent::CallEnded).await;
             }
             EndpointEvent::CallEnded { reason, .. } => {
-                if self.verbose {
+                if self.shared.verbose {
                     println!("<-- SIP: Anruf beendet ({})", reason);
                 }
                 self.forget_call();
@@ -512,13 +525,13 @@ impl SipClient {
             }
             EndpointEvent::RegistrationChanged(info) => {
                 let registered = matches!(info.status, EndpointRegistrationStatus::Registered);
-                if self.verbose {
+                if self.shared.verbose {
                     println!("<-- SIP: Registrierung {:?}", info.status);
                 }
                 let _ = events.send(SipEvent::RegistrationChanged { registered }).await;
             }
             EndpointEvent::CallCancelled { .. } => {
-                if self.verbose {
+                if self.shared.verbose {
                     println!("<-- SIP: Anruf vom Anrufer abgebrochen");
                 }
                 self.forget_call();
@@ -537,32 +550,15 @@ impl SipClient {
 struct IncomingCall {
     incoming: EndpointIncomingCall,
     events: tokio::sync::mpsc::Sender<SipEvent>,
-    current_call: Arc<std::sync::Mutex<Option<EndpointCall>>>,
-    call_active: Arc<AtomicBool>,
-    /// The sound card, so the bridge can be released again when the call ends.
-    call_audio: Arc<callaudio::CallAudio>,
-    /// Set as soon as the bridge is up, so a later go-ahead from the phone
-    /// cannot start a second one.
-    call_audio_started: Arc<AtomicBool>,
-    audio_device: &'static str,
-    verbose: bool,
+    shared: Arc<Shared>,
 }
 
 impl IncomingCall {
     async fn serve(self) {
-        let IncomingCall {
-            incoming,
-            events,
-            current_call,
-            call_active,
-            call_audio,
-            call_audio_started,
-            audio_device,
-            verbose,
-        } = self;
+        let IncomingCall { incoming, events, shared } = self;
 
         let caller = caller_number(incoming.from());
-        if verbose {
+        if shared.verbose {
             println!("<-- SIP: eingehender Anruf von {}", caller);
         }
 
@@ -582,17 +578,23 @@ impl IncomingCall {
                 Ok(call) => {
                     // An answered incoming call already carries the exact session
                     // handle, so it needs no rebuilding the way an outgoing one does.
-                    *current_call.lock().unwrap_or_else(|e| e.into_inner()) = Some(call.clone());
-                    call_active.store(true, Ordering::SeqCst);
+                    *lock(&shared.current_call) =
+                        Some(call.clone());
+                    shared.call_active.store(true, Ordering::SeqCst);
                     // Unlike the outgoing path the bridge can start right here:
                     // the phone stopped the earpiece before it let us answer, so
                     // the card is already free.
-                    call_audio_started.store(true, Ordering::SeqCst);
-                    callaudio::start(call, audio_device, verbose, call_audio);
+                    shared.call_audio_started.store(true, Ordering::SeqCst);
+                    callaudio::start(
+                        call,
+                        shared.audio_device,
+                        shared.verbose,
+                        shared.call_audio.clone(),
+                    );
                 }
                 Err(e) => {
                     println!("SIP: Annahme fehlgeschlagen: {}", explain(&e));
-                    call_active.store(false, Ordering::SeqCst);
+                    shared.call_active.store(false, Ordering::SeqCst);
                     let _ = events.send(SipEvent::CallEnded).await;
                 }
             },
@@ -620,15 +622,21 @@ pub async fn pump_audio(
 ) {
     let rate = bridge.sample_rate();
     let sender_bridge = bridge.clone();
+    let arrivals = sender_bridge.arrivals();
 
     // Outgoing direction: microphone -> RTP
     let sender_task = tokio::spawn(async move {
         let mut timestamp = 0u32;
         loop {
-            // One frame per 20 ms; if the card has nothing ready, stay in step
-            // with the frame clock instead of sending early or late.
             match sender_bridge.take_speaker() {
                 Some(samples) if !samples.is_empty() => {
+                    // The frame goes out with exactly these samples - the 8 kHz
+                    // helper only labels the rate, it does not pad - so the RTP
+                    // clock has to advance by what was really sent. Advancing by
+                    // the nominal frame size instead would let the clock drift
+                    // against the payload whenever the card hands back a short
+                    // frame, which it does whenever a read wakes early.
+                    let sent = samples.len() as u32;
                     let frame = if rate == SAMPLE_RATE {
                         EndpointAudioFrame::pcmu_sized_mono_8khz(samples, timestamp)
                     } else {
@@ -637,9 +645,22 @@ pub async fn pump_audio(
                     if sender.send(frame).await.is_err() {
                         return;
                     }
-                    timestamp = timestamp.wrapping_add(FRAME_SAMPLES as u32);
+                    timestamp = timestamp.wrapping_add(sent);
                 }
-                _ => tokio::time::sleep(Duration::from_millis(FRAME_MS)).await,
+                // Nothing to send yet. Waiting out a whole frame here would add
+                // that frame to every frame that arrives just after this look, so
+                // a bridge that can be woken is waited for instead. The timeout is
+                // only the safety net for a call that ends on an empty buffer.
+                _ => match &arrivals {
+                    Some(arrived) => {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(FRAME_MS),
+                            arrived.notified(),
+                        )
+                        .await;
+                    }
+                    None => tokio::time::sleep(Duration::from_millis(FRAME_MS)).await,
+                },
             }
         }
     });

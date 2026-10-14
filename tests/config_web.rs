@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value as Json_};
 
 use piphone::config;
-use piphone::webserver::{Action, PhoneApi};
+use piphone::command::Command;
+use piphone::webserver::PhoneApi;
 
 /// The sample configuration that ships with the project.
 fn example_path() -> PathBuf {
@@ -449,7 +450,7 @@ fn saving_does_not_trigger_any_action() {
     struct Counting {
         path: PathBuf,
         baseline: config::Table,
-        actions: std::sync::Mutex<Vec<Action>>,
+        actions: std::sync::Mutex<Vec<Command>>,
     }
 
     impl PhoneApi for Counting {
@@ -466,7 +467,7 @@ fn saving_does_not_trigger_any_action() {
                 Err(_) => json!({ "ok": false }),
             }
         }
-        fn run_action(&self, action: Action) {
+        fn run_action(&self, action: Command) {
             self.actions.lock().unwrap().push(action);
         }
     }

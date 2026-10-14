@@ -270,7 +270,7 @@ sudo systemctl enable --now piphone
 Die Tests für Schema, Weboberfläche und HTTP-Schnittstelle laufen ohne Hardware:
 
 ```
-cargo test              # 94 Tests: 38 lib, 25 config, 12 config_web, 19 webserver
+cargo test              # 136 Tests: 79 lib, 25 config, 12 config_web, 20 webserver
 ```
 
 Der Test der Oberfläche benötigt zusätzlich Node.js und `jsdom`:
@@ -283,12 +283,12 @@ node tests/test-webpage.js
 ### Hardware-Tests
 
 Diese sind nur für die Inbetriebnahme am Telefon gedacht. Jedes öffnet die Pins, die es braucht,
-darum immer einzeln ausführen:
+darum immer einzeln ausführen. Sie liegen hinter dem Feature `harness`:
 
 ```
-cargo run --example hardware-connections   # Nummernschalter, Impulskontakt, Hörer
-cargo run --example hardware-dial          # Gewählte Nummern
-cargo run --example hardware-audio         # Klingeltöne, Lautsprecher, Hörer, Gespräche
-cargo run --example gpio-probe             # GPIO-Debugging (Verkabelung)
-cargo run --release --example audio-probe -- plug:usb 8000 1   # ALSA-Parameter durchprobieren
+cargo run --features harness --example hardware-connections   # Nummernschalter, Impulskontakt, Hörer
+cargo run --features harness --example hardware-dial          # Gewählte Nummern
+cargo run --features harness --example hardware-audio         # Klingeltöne, Lautsprecher, Hörer, Gespräche
+cargo run --features harness --example gpio-probe             # GPIO-Debugging (Verkabelung)
+cargo run --release --features harness --example audio-probe -- plug:usb 8000 1   # ALSA-Parameter durchprobieren
 ```

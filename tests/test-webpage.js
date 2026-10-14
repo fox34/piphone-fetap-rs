@@ -2,8 +2,8 @@
 // mit einem echten DOM. Läuft mit:  node tests/test-webpage.js
 //
 // Benötigt jsdom (npm install jsdom). Die Seite und die Fixture werden von
-// `cargo run --example render-page` erzeugt, damit die Escape-Sequenzen in den
-// Rust-Zeichenketten korrekt aufgelöst werden.
+// `cargo run --features harness --example render-page` erzeugt, damit die
+// Escape-Sequenzen in den Rust-Zeichenketten korrekt aufgelöst werden.
 const path = require('path');
 const {execFileSync} = require('child_process');
 const {JSDOM} = require('jsdom');
@@ -11,7 +11,10 @@ const {JSDOM} = require('jsdom');
 const repo = path.resolve(__dirname, '..');
 
 function render(what) {
-  return execFileSync('cargo', ['run', '--quiet', '--example', 'render-page', '--', what],
+  // `--features harness`: die Beispiele liegen hinter diesem Feature, damit
+  // `cargo test` sie nicht mitbaut. Der Renderer braucht es also auch.
+  return execFileSync('cargo', ['run', '--quiet', '--features', 'harness',
+                                '--example', 'render-page', '--', what],
                       {cwd: repo, encoding: 'utf8'});
 }
 
@@ -34,6 +37,13 @@ window.fetch = async (url, options) => {
   return {json: async () => JSON.parse(JSON.stringify(configPayload))};
 };
 window.confirm = () => true;
+
+// jsdom kennt CSS.escape nicht, jeder echte Browser schon (seit 2016). Die Seite
+// benutzt es, um Abschnitts- und Feldnamen in Attribut-Selektoren zu setzen, und
+// fieldOf() liefe ohne den Namespace in einen ReferenceError, aus dem kein Test
+// mehr etwas sieht. Der Testlauf ergänzt ihn also, statt die Seite abzuwässern.
+window.CSS = window.CSS || {};
+window.CSS.escape = window.CSS.escape || (value => String(value).replace(/[^a-zA-Z0-9_-]/g, ch => '\\' + ch));
 
 window.eval(window.document.querySelector('script').textContent);
 
