@@ -219,6 +219,14 @@ pub struct OptionSpec {
     pub item_pattern: Option<&'static str>,
     /// Für `ValueType::List`: feste Anzahl Einträge
     pub item_count: Option<usize>,
+    /// Für `ValueType::List`: Beschriftung je Eintrag
+    ///
+    /// Gesetzt bekommt jeder Eintrag ein eigenes Eingabefeld mit eigener
+    /// Beschriftung, statt in eine Zeile eines gemeinsamen Textfeldes zu
+    /// wandern. Ohne Beschriftung bleibt es bei einer Zeile je Eintrag.
+    pub item_labels: &'static [&'static str],
+    /// Für `ValueType::List`: `type` der einzelnen Eingabefelder bei `item_labels`
+    pub item_input: &'static str,
     pub item_hint: &'static str,
     /// Änderung wird erst nach einem Neustart wirksam
     pub restart: bool,
@@ -238,6 +246,8 @@ impl OptionSpec {
             maximum: None,
             item_pattern: None,
             item_count: None,
+            item_labels: &[],
+            item_input: "text",
             item_hint: "",
             restart: false,
         }
@@ -276,6 +286,17 @@ impl OptionSpec {
 
     pub fn items(mut self, hint: &'static str) -> Self {
         self.item_hint = hint;
+        self
+    }
+
+    /// Jeden Eintrag in ein eigenes Eingabefeld mit eigener Beschriftung setzen.
+    ///
+    /// `input` ist der `type` dieser Felder, etwa "time" für Uhrzeiten. Die
+    /// Oberfläche liest die Felder in der Reihenfolge der Beschriftungen, die
+    /// Reihenfolge im Formular ist also die Reihenfolge der Liste in der Datei.
+    pub fn item_fields(mut self, labels: &'static [&'static str], input: &'static str) -> Self {
+        self.item_labels = labels;
+        self.item_input = input;
         self
     }
 
@@ -488,7 +509,8 @@ pub static SECTIONS: LazyLock<Vec<SectionSpec>> = LazyLock::new(|| {
                 OptionSpec::new("wake_up_times", "Aufstehzeiten", ValueType::List)
                     .default(Val::List(Vec::new()))
                     .item_pattern(TIME_PATTERN, 7)
-                    .items("Uhrzeit HH:MM")
+                    .item_fields(&["Montag", "Dienstag", "Mittwoch", "Donnerstag",
+                                   "Freitag", "Samstag", "Sonntag"], "time")
                     .comment(&[
                         "Uhrzeiten zum Aufstehen: Mo, Di, Mi, Do, Fr, Sa, So (Lokalzeit, ggf. inkl. Sommerzeit).",
                         "Es werden genau 7 Uhrzeiten benötigt, sonst bleibt der Nachtmodus wirkungslos.",
@@ -713,10 +735,6 @@ pub fn dump(data: &Table) -> String {
 // --------------------------------------------------------------------------------------------
 
 /// Fehler beim Lesen der Konfigurationsdatei.
-///
-/// Datei und Inhalt hadern nichts miteinander zu tun - die Datei ist entweder
-/// nicht da oder kein gültiges TOML - deshalb ein einziger Typ mit dem Grund als
-/// Text. Das ist genau das, was angezeigt wird.
 #[derive(Debug)]
 pub struct ConfigError(String);
 
@@ -1115,6 +1133,10 @@ pub fn describe(data: &Table) -> Json {
                     "minimum": limit(option, option.minimum),
                     "maximum": limit(option, option.maximum),
                     "item_hint": option.item_hint,
+                    // Beschriftet: ein Feld je Eintrag (Aufstehzeiten je
+                    // Wochentag) statt einer Zeile je Eintrag im Textfeld.
+                    "item_labels": option.item_labels,
+                    "item_input": option.item_input,
                     "restart": option.restart,
                 })
             })
@@ -1226,6 +1248,61 @@ mod tests {
             "wake_up_times = [\"06:30\", \"06:30\", \"06:30\", \"06:30\", \"06:30\", \"07:30\", \"07:30\"]"
         ));
         assert!(text.ends_with('\n'));
+    }
+
+    #[test]
+    fn labelled_lists_have_one_field_per_entry() {
+        // Die Oberfläche baut aus den Beschriftungen genau so viele Eingabefelder,
+        // wie die Option Einträge verlangt. Weichen die Zahlen ab, landen die
+        // Werte an den Wochentagen, zu denen sie nicht gehören.
+        for section in SECTIONS.iter() {
+            for option in &section.options {
+                if option.item_labels.is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    Some(option.item_labels.len()),
+                    option.item_count,
+                    "{}.{}: {} Beschriftungen für {:?} Einträge",
+                    section.name, option.key, option.item_labels.len(), option.item_count
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wake_up_times_are_described_as_a_weekday_per_field() {
+        let described = describe(&example());
+        let misc = described
+            .as_array()
+            .expect("Abschnitte")
+            .iter()
+            .find(|s| s["name"] == "misc")
+            .expect("Abschnitt misc");
+        let wake = misc["fields"]
+            .as_array()
+            .expect("Felder")
+            .iter()
+            .find(|f| f["key"] == "wake_up_times")
+            .expect("Aufstehzeiten");
+
+        assert_eq!(wake["type"], "list");
+        assert_eq!(wake["item_input"], "time");
+        // Montage zuerst, weil der Wochentag in `schedule.rs` genauso gezählt wird
+        assert_eq!(
+            wake["item_labels"].as_array().expect("Beschriftungen"),
+            &vec![
+                json!("Montag"), json!("Dienstag"), json!("Mittwoch"), json!("Donnerstag"),
+                json!("Freitag"), json!("Samstag"), json!("Sonntag")
+            ]
+        );
+        assert_eq!(
+            wake["value"].as_array().expect("Werte"),
+            &vec![
+                json!("06:30"), json!("06:30"), json!("06:30"), json!("06:30"),
+                json!("06:30"), json!("07:30"), json!("07:30")
+            ]
+        );
     }
 
     #[test]

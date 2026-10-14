@@ -91,6 +91,14 @@ The web pages have their own tests, run with node and jsdom:
 npm install && node tests/test-webpage.js
 ```
 
+They render the pages through `cargo run --example render-page`, which is a compile - and compiling
+on a development machine is not allowed. To run them from one anyway, render on the Pi and point
+`PIPHONE_RENDER` at the directory holding its output:
+
+```sh
+PIPHONE_RENDER=/path/to/render node tests/test-webpage.js
+```
+
 # Hardware test tools
 
 Each opens the pins it needs, so run them one at a time. All of them need the `harness`
@@ -125,6 +133,13 @@ The config file can also be edited in the browser at `/config`, which covers eve
 (dial codes and their targets in `[numbers]`) and ringtones are addable and removable tables. The
 schema is rendered dynamically into forms by the JS in `src/pages.rs`, so adding an option to
 `src/config.rs` makes it appear in the UI automatically.
+
+A list option puts every entry on its own line of a textarea, unless `item_fields` gives each entry a
+labelled input of its own - which is what the wake-up times use: seven weekday pickers, because a
+textarea of `06:30` seven times cannot say which of them is Saturday. Such an option has to name as
+many labels as it requires entries, because the form sends one value per field in the order of the
+labels; `labelled_lists_have_one_field_per_entry` asserts that, and it holds for every option, so a
+new one cannot get it wrong quietly.
 
 Changes are never applied to the running process and never trigger a restart; the UI points out
 that a restart is required. Writing the file regenerates all comments from the schema, so comments

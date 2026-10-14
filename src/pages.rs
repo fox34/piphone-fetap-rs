@@ -155,7 +155,8 @@ pub const CONFIG_PAGE: &str = r##"<!DOCTYPE html>
   p.hint code { color: #999; }
   label { display: block; font-size: .9rem; margin-bottom: .2rem; }
   label small { color: #666; font-weight: normal; }
-  input[type=text], input[type=number], input[type=password], select, textarea {
+  .caption { display: block; font-size: .9rem; margin-bottom: .2rem; }
+  input[type=text], input[type=number], input[type=password], input[type=time], select, textarea {
     width: 100%; box-sizing: border-box; padding: .5rem;
     background: #1c1c1c; color: #eee; border: 1px solid #333; border-radius: .3rem;
     font: inherit;
@@ -167,6 +168,8 @@ pub const CONFIG_PAGE: &str = r##"<!DOCTYPE html>
   .check { display: flex; align-items: center; gap: .5rem; margin-bottom: .75rem; }
   .check input { width: auto; }
   .check label { margin: 0; }
+  .items { display: grid; grid-template-columns: repeat(2, 1fr); gap: .5rem .75rem; }
+  .item span { display: block; font-size: .75rem; color: #777; }
   table { width: 100%; border-collapse: collapse; margin-bottom: .5rem; }
   th { font-size: .7rem; text-transform: uppercase; letter-spacing: .08em; color: #666; text-align: left; padding: 0 .5rem .25rem 0; font-weight: 600; }
   td { padding: 0 .5rem .5rem 0; vertical-align: top; }
@@ -251,7 +254,12 @@ function collect(root) {
       if (field.dataset.type === 'bool') {
         values[field.dataset.field] = input.checked;
       } else if (field.dataset.type === 'list') {
-        values[field.dataset.field] = input.value.split('\n').map(line => line.trim()).filter(Boolean);
+        // Entweder ein Feld je Eintrag (Aufstehzeiten je Wochentag) oder eine
+        // Zeile je Eintrag im Textfeld (Pfade zur Einschlafmusik).
+        const items = field.querySelectorAll('[data-item]');
+        values[field.dataset.field] = items.length
+          ? [...items].map(item => item.value.trim())
+          : input.value.split('\n').map(line => line.trim()).filter(Boolean);
       } else {
         values[field.dataset.field] = input.value;
       }
@@ -307,7 +315,15 @@ function showErrors(errors) {
       continue;
     }
 
-    found.control.classList.add('invalid');
+    // Bei einem Feld aus mehreren Eingaben (Aufstehzeiten je Wochentag) ist das
+    // leere Feld das falsche: eine Uhrzeit, die der Browser in ein
+    // `type=time` übernommen hat, ist auch eine gültige. Ohne eine davon zu
+    // finden - etwa weil die Liste zu kurz ist - werden alle markiert.
+    const items = [...found.wrapper.querySelectorAll('[data-item]')];
+    const marked = items.filter(item => !item.value);
+    (marked.length ? marked : items).forEach(item => item.classList.add('invalid'));
+    if (!items.length) found.control.classList.add('invalid');
+
     found.wrapper.after(el('div', {class: 'error', text: message}));
   }
 
@@ -334,6 +350,10 @@ function optionField(field, value) {
   }
 
   if (field.type === 'list') {
+    // Beschriftete Einträge bekommen ein eigenes Feld, unbeschriftete eine
+    // Zeile je Eintrag im Textfeld.
+    if (field.item_labels && field.item_labels.length) return itemFields(field, value);
+
     input = el('textarea', {id, rows: 3, 'data-key': field.key});
     input.value = Array.isArray(value) ? value.join('\n') : (value || '');
     return el('div', {class: 'field', 'data-field': field.key, 'data-type': field.type}, [
@@ -358,6 +378,29 @@ function optionField(field, value) {
   return el('div', {class: 'field', 'data-field': field.key, 'data-type': field.type}, [
     el('label', {for: id, text: field.label + (field.required ? ' *' : '')}),
     input,
+  ]);
+}
+
+// Eine Liste, deren Einträge im Schema beschriftet sind, bekommt ein eigenes
+// Eingabefeld je Eintrag: bei den Aufstehzeiten kann ein Textfeld über die
+// Wochentage hinweg nicht mehr sagen, welcher Wert zu welchem Tag gehört.
+// Die Felder stehen in der Reihenfolge der Beschriftungen, das ist die
+// Reihenfolge der Liste in der Datei (Montag zuerst).
+function itemFields(field, value) {
+  const values = Array.isArray(value) ? value : [];
+
+  const fields = field.item_labels.map((caption, index) => {
+    const input = el('input', {
+      id: `f-${field.key}-${index}`, type: field.item_input || 'text', 'data-item': '',
+    });
+    input.value = values[index] === null || values[index] === undefined ? '' : String(values[index]);
+
+    return el('label', {class: 'item'}, [el('span', {text: caption}), input]);
+  });
+
+  return el('div', {class: 'field', 'data-field': field.key, 'data-type': field.type}, [
+    el('span', {class: 'caption', text: field.label + (field.required ? ' *' : '')}),
+    el('div', {class: 'items'}, fields),
   ]);
 }
 

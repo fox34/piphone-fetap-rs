@@ -270,7 +270,7 @@ sudo systemctl enable --now piphone
 Die Tests für Schema, Weboberfläche und HTTP-Schnittstelle laufen ohne Hardware:
 
 ```
-cargo test              # 136 Tests: 79 lib, 25 config, 12 config_web, 20 webserver
+cargo test              # 138 Tests: 81 lib, 25 config, 12 config_web, 20 webserver
 ```
 
 Der Test der Oberfläche benötigt zusätzlich Node.js und `jsdom`:
