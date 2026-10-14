@@ -19,7 +19,7 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/boot/piphone/config.toml"));
+        .unwrap_or_else(|| PathBuf::from("/usr/local/etc/piphone/config.toml"));
 
     // Falling back to the sample keeps this runnable without a real config.
     let data = match config::read(&path) {

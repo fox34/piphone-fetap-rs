@@ -284,8 +284,8 @@ fn edits_ringtones() {
         &schema_of(&phone),
         &json!({
             "ringtones": {
-                "08912345": "/opt/piphone/sounds/ring-02.wav",
-                "01701234567": "/opt/piphone/sounds/ring-03.wav"
+                "08912345": "/usr/local/share/piphone/sounds/ring-02.wav",
+                "01701234567": "/usr/local/share/piphone/sounds/ring-03.wav"
             }
         }),
     );
@@ -293,7 +293,7 @@ fn edits_ringtones() {
     assert!(ok);
 
     let ringtones = phone.stored().get("ringtones").unwrap().as_table().unwrap().clone();
-    assert_eq!(ringtones["01701234567"].to_display_string(), "/opt/piphone/sounds/ring-03.wav");
+    assert_eq!(ringtones["01701234567"].to_display_string(), "/usr/local/share/piphone/sounds/ring-03.wav");
 
     // A number starting with 0 needs quoting in TOML.
     let text = std::fs::read_to_string(&path).unwrap();

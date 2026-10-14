@@ -1,0 +1,12 @@
+[Unit]
+Description=Play silence to I2S output using dmix to avoid pop/click noise
+After=sound.target
+
+[Service]
+ExecStart=/usr/bin/aplay -D i2s -t raw -r 48000 -c 2 -f S32_LE /dev/zero
+Restart=always
+RestartSec=1
+Nice=-20
+
+[Install]
+WantedBy=multi-user.target

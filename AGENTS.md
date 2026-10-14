@@ -44,8 +44,14 @@ A sample feature-complete configuration file is provided in `support/config-exam
 # Building
 
 - Never compile or test on macOS or Windows machines, except for End-to-End-Tests of the Webserver.
-- Access to a Raspberry Pi Zero 2W with wired-up hardware can be provided for testing.
+- Access to a Raspberry Pi Zero 2W with wired-up hardware can be provided for production testing.
 - Access to a Raspberry Pi 5 with 4GB of RAM can be provided for compiling.
+
+# Deployment
+
+- Configuration goes to /usr/local/etc/piphone/piphone.toml
+- Sound files go to /usr/local/share/piphone/
+- Release binary goes to /usr/local/bin
 
 # Layout
 

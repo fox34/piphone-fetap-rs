@@ -176,7 +176,7 @@ setTimeout(async () => {
   check('Kurzwahlen als Objekte', sent.numbers['01'] === '01234567');
   check('Kurzbefehl mitgesendet', sent.numbers['11'] === 'enable-night-mode');
   check('leere Zeile nicht mitgesendet', !('' in sent.numbers) && !Object.values(sent.numbers).includes(''));
-  check('Klingeltöne mitgesendet', sent.ringtones['08912345'] === '/opt/piphone/sounds/ring-02.wav');
+  check('Klingeltöne mitgesendet', sent.ringtones['08912345'] === '/usr/local/share/piphone/sounds/ring-02.wav');
   check('Pflichtfelder mitgesendet', sent.pins.nsi === '23' && sent.pins.gabel === '15');
 
   console.log('Fehleranzeige');

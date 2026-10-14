@@ -1,8 +1,8 @@
 # FeTAp611-VoIP-Tischtelefon auf Basis eines Raspberry Pi Zero 2 W
 
-Diese Version ist der Rust-Port von [https://github.com/fox34/piphone-fetap](piphone-fetap).
-Sie enthält einen eigenständigen SIP-Stack (`rvoip`-Crate) und benötigt keine externen Programme.
-Verhalten, Konfiguration und Weboberfläche sind identisch zur Python-Version.
+Diese Version ist ein Rust-Port von [https://github.com/fox34/piphone-fetap](piphone-fetap).
+Sie enthält im Unterschied zur Python-Variante einen eigenständigen SIP-Stack (`rvoip`-Crate)
+und hat daher keine externen Abhängigkeiten.
 
 ## Hardware-Komponenten
 
@@ -37,57 +37,47 @@ Verhalten, Konfiguration und Weboberfläche sind identisch zur Python-Version.
 Optional verbaute LEDs (Nachtlicht, Aufwachlicht) werden über die Optionen `night_light_pin` und
 `wake_light_pin` im Bereich `[pins]` konfiguriert.
 
+
 # Linux konfigurieren
 
-## Benötigte Komponenten installieren
+### 1. Benötigte Komponenten installieren
 
 ```
-sudo apt update ; sudo apt upgrade
-sudo apt install git alsa-utils --no-install-recommends
-sudo apt autoremove
+sudo apt install alsa-utils --no-install-recommends
 ```
 
-Medien werden mittels [symphonia](https://crates.io/crates/symphonia) dekodiert und über
-ALSA ausgegeben.
-`alsa-utils` bleibt installiert, weil der Dienst `i2s-silence` unten `aplay` aufruft.
+### 2. MAX98357A aktivieren
 
-## MAX98357A aktivieren
+*Quellen: [Pimoroni](https://learn.pimoroni.com/article/raspberry-pi-phat-dac-install), [Adafruit](https://learn.adafruit.com/adafruit-max98357-i2s-class-d-mono-amp/raspberry-pi-usage).*
 
-Siehe
-- https://learn.pimoroni.com/article/raspberry-pi-phat-dac-install
-- https://learn.adafruit.com/adafruit-max98357-i2s-class-d-mono-amp/raspberry-pi-usage
+1. `/boot/firmware/config.txt` anpassen:
+    ```
+    dtparam=i2s=on
+    #dtparam=audio=on
+    dtoverlay=max98357a
+    ```
 
-Datei `/boot/firmware/config.txt` anpassen:
+2. `/etc/modprobe.d/raspi-blacklist.conf` um folgende Einträge, falls vorhanden, bereinigen:
+    - `i2c-bcm2708`
+    - `snd-soc-pcm512x`
+    - `snd-soc-wm8804`
 
-```
-dtparam=i2s=on
-#dtparam=audio=on
-dtoverlay=max98357a
-```
+3. `/etc/modules` um den Eintrag `snd_bcm2835`, falls vorhanden, bereinigen.
 
-In `/etc/modprobe.d/raspi-blacklist.conf` folgende Einträge, falls vorhanden, entfernen:
 
-- `i2c-bcm2708`
-- `snd-soc-pcm512x`
-- `snd-soc-wm8804`
+### 3. Reihenfolge der Soundkarten fixieren
 
-In `/etc/modules` den Eintrag `snd_bcm2835`, falls vorhanden, entfernen.
+*Quelle: [Archlinux-Wiki](https://wiki.archlinux.org/title/Advanced_Linux_Sound_Architecture#Card_index).*
 
-## Reihenfolge der Soundkarten fixieren
-
-Siehe https://wiki.archlinux.org/title/Advanced_Linux_Sound_Architecture#Card_index
-
-Datei `/etc/modprobe.d/alsa-base.conf` anlegen:
+Damit die USB-Soundkarte immer statisch den Index 0 erhält, `/etc/modprobe.d/alsa-base.conf` anlegen bzw. ergänzen:
 
 ```
 options snd slots=snd_usb_audio
 ```
 
-Damit bekommt die USB-Soundkarte (Hörer) immer Index 0.
+### 4. Soundkarten konfigurieren
 
-## Soundkarten konfigurieren
-
-Datei `/etc/asound.conf` anpassen bzw. anlegen:
+`/etc/asound.conf` anpassen bzw. anlegen:
 
 ```
 # USB als Standardgerät
@@ -153,34 +143,7 @@ ctl.i2s {
 }
 ```
 
-## Knacken am MAX98357 bei Start einer Wiedergabe verhindern
-
-Siehe auch: https://github.com/volumio/Volumio2/issues/1973
-
-Systemd-Dienst z.B. in `/etc/systemd/system/i2s-silence.service` anlegen:
-
-```
-[Unit]
-Description=Play silence to I2S output using dmix to avoid pop/click noise
-After=sound.target
-
-[Service]
-ExecStart=/usr/bin/aplay -D i2s -t raw -r 48000 -c 2 -f S32_LE /dev/zero
-Restart=always
-RestartSec=1
-Nice=-20
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Dann aktivieren mit 
-```
-systemctl daemon-reload
-systemctl enable --now i2s-silence.service
-```
-
-## Lautstärke festlegen und für einen Neustart speichern
+### 5. Lautstärke festlegen und für einen Neustart speichern
 
 Hinweis: Funktionierte bei mir nur mit der USB-Soundkarte, nicht mit dem MAX98357.
 
@@ -189,12 +152,25 @@ alsamixer
 sudo alsactl store
 ```
 
+### 6. Knacken am MAX98357 bei Start einer Wiedergabe verhindern
+
+Siehe auch: https://github.com/volumio/Volumio2/issues/1973
+
+Systemd-Dienst z.B. in `/etc/systemd/system/i2s-silence.service` anlegen:
+
+```
+sudo cp support/etc/systemd/system/i2s-silence.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now i2s-silence.service
+```
+
+
 # Benutzung
 
 ```
 piphone [Optionen]
 
-  -c, --config <DATEI>   Pfad zur Konfigurationsdatei (Standard: /boot/piphone/config.toml)
+  -c, --config <DATEI>   Pfad zur Konfigurationsdatei (Standard: /usr/local/etc/piphone/config.toml)
       --ignore-dnd       Nicht stören für Testzwecke deaktivieren
       --no-web           Webserver zur Steuerung nicht starten
       --silent-boot      Keinen Start-Sound abspielen
@@ -204,24 +180,21 @@ piphone [Optionen]
 
 ## Konfiguration
 
-Die Konfiguration sollte bspw. unter `/boot/piphone/config.toml` abgelegt werden, damit sie auch in einem
-schreibgeschützten Root-Dateisystem (bspw. OverlayFS) angepasst werden kann. Eine kommentierte Vorlage
-gibt es in `support/config-example.toml`.
-
-```
-sudo mkdir -p /boot/piphone
-sudo cp support/config-example.toml /boot/piphone/config.toml
-sudo vim /boot/piphone/config.toml
-```
-
+Die Konfiguration wird standardmäßig unter `/usr/local/etc/piphone/config.toml` erwartet.
 Ein anderer Pfad kann über `-c/--config` angegeben werden.
+Eine kommentierte Vorlage gibt es in `support/config-example.toml`.
 
-Beim Speichern - aus der Weboberfläche heraus - wird die Datei vollständig aus dem Schema neu
-geschrieben: Kommentare und Einträge, zu denen es keine Option gibt, gehen dabei verloren. Das
-Telefon nennt beim Start, was ihm in der Datei unbekannt vorkommt, und die Oberfläche zeigt nach
-dem Speichern, was entfernt wurde.
+```
+sudo mkdir -p /usr/local/etc/piphone
+sudo cp support/config-example.toml /usr/local/etc/piphone/config.toml
+sudo vim /usr/local/etc/piphone/config.toml
+```
 
-# Bonusfunktionen
+Beim Speichern aus der Weboberfläche heraus wird die Datei vollständig aus dem Schema neu geschrieben, Kommentare und
+unbekannte Konfigurationsoptionen werden dabei entfernt.
+
+
+# Sonderfunktionen
 
 ## Webserver
 
@@ -249,6 +222,7 @@ auch eine Aufwachlicht-LED konfiguriert werden.
 Über die Kurzwahl `start-sleep-music` wird die Spieluhr aktiviert.
 Die Spieluhr stoppt, sobald der Hörer abgehoben wird.
 
+
 # Kompilieren
 
 Kompilieren muss auf einem Linux-System (z.B. Debian Trixie) durchgeführt werden.
@@ -259,7 +233,7 @@ Neben den u.g. Paketen wird auch eine Rust-Toolchain (`rustup`) benötigt.
 ```
 apt install build-essentials pkg-config libasound2-dev libgpiod-dev
 cargo build --release
-scp target/release/aarch64-unknown-linux-gnu/release/piphone pi:/opt/piphone/piphone
+scp target/release/aarch64-unknown-linux-gnu/release/piphone piphone:/usr/local/bin/piphone
 ```
 
 Gestartet wird der Dienst über systemd, siehe `support/etc/systemd/system/piphone.service`:
@@ -283,13 +257,6 @@ Der Test der Oberfläche benötigt zusätzlich Node.js und `jsdom`:
 ```
 npm install jsdom
 node tests/test-webpage.js
-```
-
-Der Test rendert die Seiten über `cargo run --example render-page`; wer das nicht auf dem
-Entwicklerrechner tun darf (siehe `AGENTS.md`), rendert auf dem Pi und übergibt das Ergebnis:
-
-```
-PIPHONE_RENDER=/pfad/zum/render node tests/test-webpage.js
 ```
 
 ### Hardware-Tests

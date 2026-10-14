@@ -1,4 +1,4 @@
-# Diese Datei muss nach /boot/piphone/config.toml, um auch in einem RO-Dateisystem angepasst werden zu können
+# /usr/local/etc/piphone/config.toml
 #
 # Die Datei lässt sich auch im Webinterface des Telefons bearbeiten (/config). Beim Speichern
 # wird sie aus dem Schema in lib/config.py neu geschrieben: Die Kommentare entstehen dabei neu,
@@ -53,25 +53,25 @@ gabel = 15
 
 [ringtones]
 # Rufnummerspezifische Klingeltöne
-"08912345" = "/opt/piphone/sounds/ring-02.wav"
+"08912345" = "/usr/local/share/piphone/sounds/ring-02.wav"
 
 [sounds]
-boot = "/opt/piphone/sounds/boot-loud.wav"
-reboot = "/opt/piphone/sounds/reboot-loud.wav"
-shutdown = "/opt/piphone/sounds/shutdown-loud.wav"
+boot = "/usr/local/share/piphone/sounds/boot-loud.wav"
+reboot = "/usr/local/share/piphone/sounds/reboot-loud.wav"
+shutdown = "/usr/local/share/piphone/sounds/shutdown-loud.wav"
 
 # Generischer Klingelton
-ring = "/opt/piphone/sounds/ring-01.wav"
+ring = "/usr/local/share/piphone/sounds/ring-01.wav"
 
-test_earpiece = "/opt/piphone/sounds/test-earpiece.wav"
-test_loud = "/opt/piphone/sounds/test-loud.wav"
+test_earpiece = "/usr/local/share/piphone/sounds/test-earpiece.wav"
+test_loud = "/usr/local/share/piphone/sounds/test-loud.wav"
 
 
-action_confirmed = "/opt/piphone/sounds/confirm.wav"
+action_confirmed = "/usr/local/share/piphone/sounds/confirm.wav"
 
 # Einschlafmusik: mehrere Dateien werden in zufälliger Reihenfolge abgespielt.
 # Beispieldatei aus urheberrechtlichen Gründen nicht in Repository
-sleep_music = ["/opt/piphone/sounds/sleep-Brahms_Lullaby.mp3"]
+sleep_music = ["/usr/local/share/piphone/sounds/sleep-Brahms_Lullaby.mp3"]
 
 # Nachtmodus / Aufwachlicht
 [misc]

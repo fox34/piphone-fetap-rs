@@ -15,7 +15,7 @@ Aufruf:
   piphone [Optionen]
 
 Optionen:
-  -c, --config <DATEI>   Pfad zur Konfigurationsdatei (Standard: /boot/piphone/config.toml)
+  -c, --config <DATEI>   Pfad zur Konfigurationsdatei (Standard: /usr/local/etc/piphone/config.toml)
       --ignore-dnd       Nicht stören für Testzwecke deaktivieren
       --no-web           Webserver zur Steuerung nicht starten
       --silent-boot      Keinen Start-Sound abspielen

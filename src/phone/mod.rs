@@ -51,7 +51,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
-            config: PathBuf::from("/boot/piphone/config.toml"),
+            config: PathBuf::from("/usr/local/etc/piphone/config.toml"),
             ignore_dnd: false,
             no_web: false,
             silent_boot: false,

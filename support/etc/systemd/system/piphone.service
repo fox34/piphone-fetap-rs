@@ -5,7 +5,7 @@ StartLimitIntervalSec=300
 After=i2s-silence.service
 
 [Service]
-ExecStart=/opt/piphone/piphone --config /boot/piphone/config.toml
+ExecStart=/usr/local/bin/piphone --config /usr/local/etc/piphone/config.toml
 Type=simple
 User=root
 Nice=-15

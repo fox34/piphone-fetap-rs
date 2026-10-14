@@ -325,9 +325,9 @@ fn valid_payload() -> Json_ {
         },
         "pins": { "nsi": "23", "nsa": "24", "gabel": "15" },
         "numbers": { "01": "01234567", "07": "+4989123456", "11": "enable-night-mode" },
-        "ringtones": { "08912345": "/opt/piphone/sounds/ring-02.wav" },
+        "ringtones": { "08912345": "/usr/local/share/piphone/sounds/ring-02.wav" },
         "sounds": {
-            "ring": "/opt/piphone/sounds/ring-01.wav",
+            "ring": "/usr/local/share/piphone/sounds/ring-01.wav",
             "sleep_music": ["/opt/a.mp3", "/opt/b.mp3"]
         },
         "misc": {
