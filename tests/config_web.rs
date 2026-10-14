@@ -29,7 +29,7 @@ struct FilePhone {
 
 impl FilePhone {
     fn new(path: &Path) -> Self {
-        let baseline = config::validate(&config::read(path).expect("Beispieldatei lesen"), None).0;
+        let baseline = config::validate(&config::read(path).expect("Beispieldatei lesen")).0;
         FilePhone { path: path.to_path_buf(), baseline }
     }
 
@@ -381,47 +381,56 @@ fn written_file_carries_the_generated_comments() {
     assert!(text.ends_with('\n'), "Datei muss mit Zeilenumbruch enden");
 }
 
+/// The form does not know entries the schema does not have, so it never sends
+/// them. They are gone from the file after the next save - and the save says so,
+/// because losing an entry silently is the one thing worse than losing it.
 #[test]
-fn unknown_settings_survive_a_save() {
+fn unknown_settings_are_dropped_and_reported() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.toml");
 
     // An unknown section, and an unknown option inside a known one.
     let text = std::fs::read_to_string(example_path()).unwrap();
-    let text = text.replacen("[sip]", "[sip]\nzusatz = \"bleibt erhalten\"", 1);
+    let text = text.replacen("[sip]", "[sip]\nzusatz = \"nur von Hand gesetzt\"", 1);
     let text = format!("{}\n[sonder]\nx = 1\n", text);
     std::fs::write(&path, &text).unwrap();
 
     let phone = FilePhone::new(&path);
 
-    let special = phone.baseline.get("sonder").and_then(|s| s.as_table()).expect("Sonderabschnitt");
-    assert_eq!(special["x"].to_display_string(), "1", "Sonderabschnitt beim Start lesen");
-    assert_eq!(config::option_str(&phone.baseline, "sip", "zusatz"), "bleibt erhalten");
+    // The phone reads what is in the file, but its own view of the
+    // configuration only holds what the schema knows.
+    assert!(
+        phone.baseline.get("sonder").is_none(),
+        "Sonderabschnitt gehört nicht in den Stand"
+    );
+    assert_eq!(config::option_str(&phone.baseline, "sip", "host"), "10.0.0.1");
 
     let form = as_browser_sends(
         &schema_of(&phone),
         &json!({ "network": { "wifi_test_host": "10.0.0.2" } }),
     );
-    let (ok, _, _, result) = save(&phone, &form);
-    assert!(ok, "{}", result);
+    let incoming = config::from_json(&form);
+    let saved = config::save(&path, &incoming, &phone.baseline).expect("Speichern");
+
+    assert_eq!(saved.changed, vec!["[network]".to_string()]);
+    // Alphabetisch nach Abschnitt, die Reihenfolge steckt in der `Table`.
+    assert_eq!(
+        saved.dropped,
+        vec!["sip.zusatz".to_string(), "[sonder]".to_string()],
+        "die verlorenen Einträge müssen benannt werden"
+    );
 
     let stored = phone.stored();
     assert_eq!(config::option_str(&stored, "network", "wifi_test_host"), "10.0.0.2");
-
-    let special = stored.get("sonder").and_then(|s| s.as_table()).expect("Sonderabschnitt");
-    assert_eq!(special["x"].to_display_string(), "1", "Sonderabschnitt verloren");
-
-    // The form does not know this option, so it is not sent - but it must
-    // survive the save all the same.
-    assert_eq!(
-        config::option_str(&stored, "sip", "zusatz"),
-        "bleibt erhalten",
-        "unbekannte Option verloren"
-    );
+    assert_eq!(config::option_str(&stored, "sip", "host"), "10.0.0.1");
 
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.contains("[sonder]"), "Sonderabschnitt nicht in der Datei");
-    assert!(text.contains("zusatz"), "unbekannte Option nicht in der Datei");
+    assert!(!text.contains("[sonder]"), "Sonderabschnitt nicht entfernt:\n{}", text);
+    assert!(!text.contains("zusatz"), "unbekannte Option nicht entfernt:\n{}", text);
+
+    // Nothing is dropped from a file that has nothing unknown in it.
+    let saved = config::save(&path, &incoming, &saved.cleaned).expect("Speichern");
+    assert!(saved.dropped.is_empty(), "{:?}", saved.dropped);
 }
 
 #[test]
@@ -472,7 +481,7 @@ fn saving_does_not_trigger_any_action() {
         }
     }
 
-    let baseline = config::validate(&config::read(&path).unwrap(), None).0;
+    let baseline = config::validate(&config::read(&path).unwrap()).0;
     let phone = Counting { path, baseline, actions: std::sync::Mutex::new(Vec::new()) };
 
     let incoming = config::from_json(&as_browser_sends(

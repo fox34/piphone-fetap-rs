@@ -143,7 +143,11 @@ new one cannot get it wrong quietly.
 
 Changes are never applied to the running process and never trigger a restart; the UI points out
 that a restart is required. Writing the file regenerates all comments from the schema, so comments
-written by hand in the file are not preserved.
+written by hand in the file are not preserved. For the same reason `dump` writes the file from
+`SECTIONS` alone and an entry no option exists for is *dropped* rather than carried over: a leftover
+from another version would otherwise sit in the file forever, unread and untended. That is data
+loss, so it is not silent - `config::unknown` names what is there at startup and `Saved::dropped`
+names what a save removed, which the page prints next to the restart notice.
 
 The file is saved through a temporary file that is written, read back, compared and only then moved
 into place. Its name carries the process id *and* a counter, because two tabs in a browser are

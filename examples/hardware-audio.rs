@@ -32,7 +32,7 @@ fn main() {
             .expect("Beispielkonfiguration lesen")
         }
     };
-    let (data, _) = config::validate(&data, None);
+    let (data, _) = config::validate(&data);
 
     let sound = |key: &str| config::option_str(&data, "sounds", key);
     let audio = Audio::default();

@@ -203,8 +203,19 @@ impl Phone {
         let mut config = config::read(&options.config)
             .map_err(|e| format!("Konfigurationsdatei {} ist kein gültiges TOML: {}", options.config.display(), e))?;
 
+        // Was das Schema nicht kennt, liest das Telefon nicht - es steht nur in
+        // der Datei und verschwindet beim nächsten Speichern. Vorher sagen, was
+        // es ist: das ist die letzte Gelegenheit, bevor es weg ist.
+        let unknown = config::unknown(&config);
+        if !unknown.is_empty() {
+            println!("Konfiguration enthält {} unbekannte Einträge, die beim Speichern entfernt werden:", unknown.len());
+            for entry in unknown {
+                println!(" - {}", entry);
+            }
+        }
+
         // The baseline is taken before --ignore-dnd so that flag never reaches the file.
-        let (baseline, errors) = config::validate(&config, None);
+        let (baseline, errors) = config::validate(&config);
         if !errors.is_empty() {
             // The phone runs on the values as they stand in the file rather than
             // on the checked ones, so a rejected value is not replaced by its

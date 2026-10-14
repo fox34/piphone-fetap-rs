@@ -216,6 +216,11 @@ sudo vim /boot/piphone/config.toml
 
 Ein anderer Pfad kann über `-c/--config` angegeben werden.
 
+Beim Speichern - aus der Weboberfläche heraus - wird die Datei vollständig aus dem Schema neu
+geschrieben: Kommentare und Einträge, zu denen es keine Option gibt, gehen dabei verloren. Das
+Telefon nennt beim Start, was ihm in der Datei unbekannt vorkommt, und die Oberfläche zeigt nach
+dem Speichern, was entfernt wurde.
+
 # Bonusfunktionen
 
 ## Webserver
@@ -278,6 +283,13 @@ Der Test der Oberfläche benötigt zusätzlich Node.js und `jsdom`:
 ```
 npm install jsdom
 node tests/test-webpage.js
+```
+
+Der Test rendert die Seiten über `cargo run --example render-page`; wer das nicht auf dem
+Entwicklerrechner tun darf (siehe `AGENTS.md`), rendert auf dem Pi und übergibt das Ergebnis:
+
+```
+PIPHONE_RENDER=/pfad/zum/render node tests/test-webpage.js
 ```
 
 ### Hardware-Tests

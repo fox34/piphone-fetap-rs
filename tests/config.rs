@@ -51,7 +51,7 @@ fn with(sections: &[(&str, &[(&str, &str)])]) -> Table {
 
 /// The errors produced by validating the base configuration plus `sections`.
 fn errors_of(sections: &[(&str, &[(&str, &str)])]) -> Errors {
-    config::validate(&with(sections), None).1
+    config::validate(&with(sections)).1
 }
 
 /// The errors for one key, if any.
@@ -72,7 +72,7 @@ fn example_configuration_is_valid_and_round_trips() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("support/config-example.toml");
     let original = config::read(&path).expect("Beispieldatei lesen");
 
-    let (cleaned, errors) = config::validate(&original, None);
+    let (cleaned, errors) = config::validate(&original);
     assert!(errors.is_empty(), "Beispieldatei ist ungültig: {:?}", messages(&errors));
 
     let text = config::dump(&cleaned);
@@ -114,7 +114,7 @@ fn messages(errors: &Errors) -> Vec<String> {
 
 #[test]
 fn missing_required_options_are_reported_in_schema_order() {
-    let (empty, errors) = config::validate(&Table::new(), None);
+    let (empty, errors) = config::validate(&Table::new());
 
     assert_eq!(
         errors.keys().collect::<Vec<_>>(),
@@ -133,7 +133,7 @@ fn missing_required_options_are_reported_in_schema_order() {
 fn values_from_the_form_keep_their_types() {
     // The browser sends everything as a string; the schema decides the type.
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("support/config-example.toml");
-    let (cleaned, errors) = config::validate(&config::read(&path).unwrap(), None);
+    let (cleaned, errors) = config::validate(&config::read(&path).unwrap());
     assert!(errors.is_empty());
 
     // Numbers stay integers rather than becoming floats.
@@ -161,7 +161,7 @@ fn values_from_the_form_keep_their_types() {
 
 #[test]
 fn accepts_the_minimum_configuration() {
-    assert!(config::validate(&base(), None).1.is_empty());
+    assert!(config::validate(&base()).1.is_empty());
 }
 
 #[test]
@@ -206,7 +206,7 @@ fn accepts_the_usual_checkbox_spellings() {
         );
     }
 
-    let (cleaned, _) = config::validate(&with(&[("sip", &[("whitelist_active", "\"an\"")])]), None);
+    let (cleaned, _) = config::validate(&with(&[("sip", &[("whitelist_active", "\"an\"")])]));
     assert_eq!(section_of(&cleaned, "sip")["whitelist_active"], Val::Bool(true));
 }
 
@@ -229,13 +229,13 @@ fn enforces_the_brightness_range_but_allows_fractions() {
         .get("misc.night_light_duty")
         .is_some());
 
-    let (cleaned, _) = config::validate(&with(&[("misc", &[("night_light_duty", "33.5")])]), None);
+    let (cleaned, _) = config::validate(&with(&[("misc", &[("night_light_duty", "33.5")])]));
     assert_eq!(section_of(&cleaned, "misc")["night_light_duty"], Val::Float(33.5));
 }
 
 #[test]
 fn a_numeric_password_stays_text() {
-    let (cleaned, errors) = config::validate(&with(&[("sip", &[("pass", "\"4711\"")])]), None);
+    let (cleaned, errors) = config::validate(&with(&[("sip", &[("pass", "\"4711\"")])]));
     assert!(errors.is_empty());
     assert_eq!(config::option_str(&cleaned, "sip", "pass"), "4711");
 }
@@ -305,7 +305,7 @@ fn accepts_the_built_in_commands_as_short_codes() {
 fn an_unknown_command_is_treated_as_a_number() {
     // `shutdown` is a known command, so it skips the number check; anything
     // else has to look like a phone number.
-    let (cleaned, errors) = config::validate(&with(&[("numbers", &[("01", "\"01234567\"")])]), None);
+    let (cleaned, errors) = config::validate(&with(&[("numbers", &[("01", "\"01234567\"")])]));
     assert!(errors.is_empty());
     assert_eq!(section_of(&cleaned, "numbers")["01"].to_display_string(), "01234567");
 }
@@ -331,26 +331,47 @@ fn ringtones_need_a_file_and_accept_any_key() {
 // Unknown settings
 // -----------------------------------------------------------------------------
 
+/// The file is written from the schema, so an entry that the schema does not
+/// know is lost on the next save. It has to be named before it goes, otherwise
+/// the user finds out from the missing entry.
 #[test]
-fn unknown_options_and_sections_are_kept() {
+fn unknown_options_and_sections_are_dropped() {
     let mut data = base();
     if let Val::Table(sip) = data.get_mut("sip").expect("sip") {
         sip.insert("zusatz".to_string(), Val::Int(42));
     }
-    data.insert("eigener_abschnitt".to_string(), Val::Table([("x".to_string(), Val::Str("y".to_string()))].into()));
-
-    let (cleaned, errors) = config::validate(&data, None);
-    assert!(errors.is_empty());
-
-    assert_eq!(section_of(&cleaned, "sip")["zusatz"], Val::Int(42));
-    assert_eq!(
-        cleaned.get("eigener_abschnitt").and_then(|s| s.as_table()).unwrap()["x"],
-        Val::Str("y".into())
+    data.insert(
+        "eigener_abschnitt".to_string(),
+        Val::Table([("x".to_string(), Val::Str("y".to_string()))].into()),
     );
 
-    // And they survive being written out.
-    let reloaded = config::parse(&config::dump(&cleaned)).expect("TOML lesbar");
+    assert_eq!(
+        config::unknown(&data),
+        vec!["[eigener_abschnitt]".to_string(), "sip.zusatz".to_string()]
+    );
+
+    let (cleaned, errors) = config::validate(&data);
+    assert!(errors.is_empty());
+
+    assert!(!section_of(&cleaned, "sip").contains_key("zusatz"), "unbekannte Option behalten");
+    assert!(!cleaned.contains_key("eigener_abschnitt"), "unbekannter Abschnitt behalten");
+
+    // And they are not written back.
+    let text = config::dump(&cleaned);
+    assert!(!text.contains("zusatz"), "unbekannte Option in der Datei");
+    assert!(!text.contains("eigener_abschnitt"), "unbekannter Abschnitt in der Datei");
+
+    let reloaded = config::parse(&text).expect("TOML lesbar");
     assert_eq!(reloaded, cleaned);
+}
+
+/// Every key in `[numbers]` and `[ringtones]` is a short code or a number, not a
+/// schema key - so none of them can be "unknown".
+#[test]
+fn entry_tables_are_not_unknown() {
+    let data = with(&[("numbers", &[("42", "\"01299999\"")]), ("ringtones", &[("0891234", "\"/a.wav\"")])]);
+    assert!(config::unknown(&data).is_empty());
+    assert!(config::validate(&data).0.contains_key("numbers"));
 }
 
 // -----------------------------------------------------------------------------
@@ -365,7 +386,7 @@ fn writes_through_a_temporary_file() {
     let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("support/config-example.toml");
     std::fs::copy(&example, &path).unwrap();
 
-    let (baseline, errors) = config::validate(&config::read(&path).unwrap(), None);
+    let (baseline, errors) = config::validate(&config::read(&path).unwrap());
     assert!(errors.is_empty(), "Ausgangsdatei ungültig");
 
     // An unchanged save must leave the file readable and complete.
@@ -415,7 +436,7 @@ fn a_failed_save_leaves_the_file_alone() {
     let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("support/config-example.toml");
     std::fs::copy(&example, &path).unwrap();
 
-    let (baseline, _) = config::validate(&config::read(&path).unwrap(), None);
+    let (baseline, _) = config::validate(&config::read(&path).unwrap());
     let before = std::fs::read_to_string(&path).unwrap();
 
     // An invalid configuration must be refused without touching the file.

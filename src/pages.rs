@@ -470,9 +470,12 @@ function renderSection(section) {
 
 // ---------------------------------------------------------------- Laden und Speichern
 
-const savedBanner = (extra = []) => {
+const savedBanner = (changed = [], dropped = []) => {
   const items = ['Gespeichert in der Konfigurationsdatei.'];
-  if (extra.length) items.push('Geändert wurden: ' + extra.join(', '));
+  if (changed.length) items.push('Geändert wurden: ' + changed.join(', '));
+  // Beim Speichern fällt weg, was das Schema nicht kennt. Das gehört in die
+  // Meldung, sonst verschwindet der Eintrag ersatzlos.
+  if (dropped.length) items.push('Unbekannte Einträge wurden entfernt: ' + dropped.join(', '));
   return banner('warn', 'Das Telefon muss neu gestartet werden, damit die Änderungen wirksam werden.', items);
 };
 
@@ -525,7 +528,7 @@ document.getElementById('save').addEventListener('click', async () => {
       // Standardwerte und Prüfungen sichtbar werden
       config = await (await fetch('/api/config')).json();
       render(config);
-      message.replaceChildren(savedBanner(response.changed || []));
+      message.replaceChildren(savedBanner(response.changed || [], response.dropped || []));
       return;
     }
 

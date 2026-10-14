@@ -43,7 +43,7 @@ impl PhoneApi for StubPhone {
 
     fn save_config(&self, payload: Json_) -> Json_ {
         let incoming = config::from_json(&payload);
-        let (cleaned, errors) = config::validate(&incoming, None);
+        let (cleaned, errors) = config::validate(&incoming);
 
         if !errors.is_empty() {
             let map: serde_json::Map<String, Json_> = errors

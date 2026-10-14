@@ -10,6 +10,12 @@ const {JSDOM} = require('jsdom');
 
 const repo = path.resolve(__dirname, '..');
 
+// Seite und Fixture kommen normalerweise aus `cargo`, also aus einem Build auf
+// einem Raspberry Pi: auf einem Entwicklerrechner ist das nicht erlaubt
+// (AGENTS.md). PIPHONE_RENDER zeigt stattdessen auf ein Verzeichnis, in dem
+// beide Ausgaben liegen, etwa so erzeugt:
+//   cargo run --features harness --example render-page -- CONFIG_PAGE > $DIR/CONFIG_PAGE
+//   cargo run --features harness --example render-page -- fixture      > $DIR/fixture
 function render(what) {
   // `--features harness`: die Beispiele liegen hinter diesem Feature, damit
   // `cargo test` sie nicht mitbaut. Der Renderer braucht es also auch.
@@ -18,14 +24,20 @@ function render(what) {
                       {cwd: repo, encoding: 'utf8'});
 }
 
+function rendered(what) {
+  const directory = process.env.PIPHONE_RENDER;
+  if (!directory) return render(what);
+  return require('fs').readFileSync(path.join(directory, what), 'utf8');
+}
+
 let ok = 0, failed = 0;
 function check(label, condition, detail = '') {
   if (condition) { ok++; console.log(`  ok  ${label}`); }
   else { failed++; console.log(`FAIL  ${label} ${detail}`); }
 }
 
-const html = render('CONFIG_PAGE');
-const configPayload = JSON.parse(render('fixture'));
+const html = rendered('CONFIG_PAGE');
+const configPayload = JSON.parse(rendered('fixture'));
 
 const dom = new JSDOM(html, {runScripts: 'outside-only', url: 'http://localhost/config'});
 const {window} = dom;
@@ -86,8 +98,18 @@ setTimeout(async () => {
   check('Checkbox gesetzt',
     doc.querySelector('[data-section="sip"] [data-field="whitelist_active"] input').checked === false);
 
-  const wake = doc.querySelector('[data-section="misc"] [data-field="wake_up_times"] textarea').value;
-  check('Liste über Zeilen gefüllt', wake.split('\n').length === 7, JSON.stringify(wake));
+  const wakeField = '[data-section="misc"] [data-field="wake_up_times"]';
+  const wakePickers = [...doc.querySelectorAll(`${wakeField} [data-item]`)];
+  check('Aufstehzeiten als Uhrzeitfelder', wakePickers.length === 7 && wakePickers.every(i => i.type === 'time'),
+        wakePickers.map(i => i.value).join(','));
+  check('Wochentage als Beschriftung',
+        [...doc.querySelectorAll(`${wakeField} .item span`)].map(s => s.textContent)
+          .join(',') === 'Montag,Dienstag,Mittwoch,Donnerstag,Freitag,Samstag,Sonntag');
+  check('Aufstehzeiten in Wochentagsreihenfolge gefüllt',
+        wakePickers.map(i => i.value).join(',') === '06:30,06:30,06:30,06:30,06:30,07:30,07:30',
+        wakePickers.map(i => i.value).join(','));
+  check('kein Textfeld mehr für die Aufstehzeiten',
+        doc.querySelector(`${wakeField} textarea`) === null);
   check('Einschlafmusik als Zeilen',
     doc.querySelector('[data-section="sounds"] [data-field="sleep_music"] textarea').value.includes('.mp3'));
 
@@ -128,8 +150,10 @@ setTimeout(async () => {
   doc.querySelector('[data-section="sip"] [data-field="host"] input').value = 'fritz.box';
   doc.querySelector('[data-section="sip"] [data-field="dial_timeout"] input').value = '45';
   doc.querySelector('[data-section="sip"] [data-field="whitelist_active"] input').checked = true;
-  doc.querySelector('[data-section="misc"] [data-field="wake_up_times"] textarea').value =
-    '05:00\n05:00\n05:00\n05:00\n05:00\n06:00\n06:00';
+  // Ein Tag je Feld: Montag früher, Samstag später als in der Konfiguration
+  '05:00,05:00,05:00,05:00,05:00,06:00,06:00'.split(',').forEach((time, index) => {
+    doc.querySelectorAll(`${wakeField} [data-item]`)[index].value = time;
+  });
   const emptyRow = rows('numbers')[9];
   emptyRow.querySelectorAll('input')[0].value = '';
   emptyRow.querySelectorAll('input')[1].value = '';
@@ -145,7 +169,9 @@ setTimeout(async () => {
   check('Zahlenwert als Text gesendet', sent.sip.dial_timeout === '45');
   check('Checkbox als Boolean gesendet', sent.sip.whitelist_active === true);
   check('Liste als Array gesendet', Array.isArray(sent.misc.wake_up_times) && sent.misc.wake_up_times.length === 7);
-  check('unveränderte Liste korrekt', sent.misc.wake_up_times[5] === '06:00');
+  check('Aufstehzeiten in Wochentagsreihenfolge gesendet',
+    sent.misc.wake_up_times.join(',') === '05:00,05:00,05:00,05:00,05:00,06:00,06:00',
+    JSON.stringify(sent.misc.wake_up_times));
   check('Einschlafmusik als Array', Array.isArray(sent.sounds.sleep_music));
   check('Kurzwahlen als Objekte', sent.numbers['01'] === '01234567');
   check('Kurzbefehl mitgesendet', sent.numbers['11'] === 'enable-night-mode');
@@ -156,6 +182,10 @@ setTimeout(async () => {
   console.log('Fehleranzeige');
   // Kurzwahl auf einen ungültigen Wert setzen, damit der Fehler einer Zeile zugeordnet werden kann
   rows('numbers')[0].querySelectorAll('input')[0].value = '1234567';
+
+  // Mittwoch leer: das ist der Grund, aus dem der Server die Woche ablehnt
+  const pickers = [...doc.querySelectorAll(`${wakeField} [data-item]`)];
+  pickers[2].value = '';
 
   const response = {
     ok: false,
@@ -181,6 +211,11 @@ setTimeout(async () => {
     doc.querySelector('[data-section="numbers"] [data-row] input').classList.contains('invalid'));
   check('Fehler am Feld angezeigt',
     doc.querySelector('[data-section="sip"] [data-field="host"]').parentElement.querySelector('.error') !== null);
+  check('nur das leere Uhrzeitfeld markiert',
+    pickers[2].classList.contains('invalid') && pickers.filter(i => i.classList.contains('invalid')).length === 1,
+    pickers.map(i => i.value + (i.classList.contains('invalid') ? '!' : '')).join(','));
+  check('Fehler an den Aufstehzeiten angezeigt',
+    doc.querySelector(wakeField).parentElement.querySelector('.error') !== null);
 
   // Nach erneutem Speichern ohne Fehler müssen alle Markierungen verschwunden sein
   window.fetch = async (url, options) => ({

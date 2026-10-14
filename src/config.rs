@@ -5,6 +5,11 @@
 //! versehen, der aus diesem Schema erzeugt wird. Kommentare, die von Hand in der
 //! Konfigurationsdatei stehen, werden beim Speichern nicht beibehalten - die Datei
 //! enthält anschließend nur noch die Kommentare aus dem Schema.
+//!
+//! Aus demselben Grund werden Einträge, die das Schema nicht kennt, beim Speichern
+//! entfernt: Die Datei entsteht vollständig aus dem Schema. Ein Eintrag, den keine
+//! Version des Telefons liest, bleibt sonst als Datenmüll zurück und wird bei jedem
+//! Speichern mitgeschleppt. [`unknown`] benennt, was beim Speichern verloren geht.
 
 use regex::Regex;
 use serde_json::{json, Map, Value as Json};
@@ -613,12 +618,13 @@ impl FromIterator<(String, String)> for Errors {
 // TOML-Schreiben
 // --------------------------------------------------------------------------------------------
 
-const HEADER: [&str; 5] = [
+const HEADER: [&str; 6] = [
     "# PiPhone-Konfiguration",
     "#",
     "# Diese Datei kann auch im Webinterface des Telefons bearbeitet werden.",
     "# Kommentare werden beim Speichern aus dem Schema neu erzeugt,",
     "# selbst geschriebene Kommentare werden dabei nicht beibehalten.",
+    "# Einträge, die es im Schema nicht gibt, werden beim Speichern entfernt.",
 ];
 
 /// TOML-Schlüssel: In Anführungszeichen, sofern kein einfacher Schlüssel möglich ist
@@ -675,6 +681,9 @@ pub fn toml_value(value: &Val) -> String {
 }
 
 /// Konfiguration mit Kommentaren als TOML-Text erzeugen
+///
+/// Es werden nur Abschnitte und Optionen aus [`SECTIONS`] geschrieben. Alles
+/// andere in `data` fällt hier still weg - [`unknown`] sagt vorher, was es ist.
 pub fn dump(data: &Table) -> String {
     let mut lines: Vec<String> = HEADER.iter().map(|l| l.to_string()).collect();
 
@@ -693,41 +702,49 @@ pub fn dump(data: &Table) -> String {
                 lines.push(format!("{} = {}", toml_key(key), toml_value(value)));
             }
         } else {
-            let mut known: Vec<&str> = Vec::new();
             for option in &section.options {
-                known.push(option.key);
                 for line in option.comment {
                     lines.push(format!("# {}", line));
                 }
                 let value = values.get(option.key).or(option.default.as_ref()).unwrap_or(&Val::Null);
                 lines.push(format!("{} = {}", option.key, toml_value(value)));
             }
-
-            // Unbekannte Optionen unverändert übernehmen
-            for (key, value) in values {
-                if !known.contains(&key.as_str()) {
-                    lines.push(format!("{} = {}", toml_key(key), toml_value(value)));
-                }
-            }
-        }
-    }
-
-    // Unbekannte Abschnitte ebenfalls nicht verlieren
-    for (name, value) in data {
-        if !SECTIONS.iter().any(|s| s.name == name) {
-            lines.push(String::new());
-            lines.push(format!("[{}]", toml_key(name)));
-            if let Some(table) = value.as_table() {
-                for (key, item) in table {
-                    lines.push(format!("{} = {}", toml_key(key), toml_value(item)));
-                }
-            } else {
-                lines.push(format!("{} = {}", toml_key("value"), toml_value(value)));
-            }
         }
     }
 
     lines.join("\n") + "\n"
+}
+
+/// Die Einträge einer Konfiguration, die das Schema nicht kennt.
+///
+/// Sie werden von [`dump`] nicht geschrieben, also beim Speichern entfernt. Das
+/// ist der Fall für einen Abschnitt, den es nicht gibt, und für einen Schlüssel
+/// in einem bekannten Abschnitt. In einer Eintragstabelle wie `[numbers]` gibt es
+/// keine festen Schlüssel - jeder Eintrag dort ist eine Kurzwahl bzw. eine
+/// Rufnummer, und ein unbekannter ist einfach ein unbekannter Kurzbefehl.
+///
+/// Die Reihenfolge ist alphabetisch nach Abschnitt, weil `data` eine
+/// `BTreeMap` ist und die Meldung sonst von der Schreibweise der Datei abhinge.
+pub fn unknown(data: &Table) -> Vec<String> {
+    let mut found = Vec::new();
+
+    for (name, value) in data {
+        let Some(section) = SECTIONS.iter().find(|section| section.name == name) else {
+            found.push(format!("[{}]", name));
+            continue;
+        };
+        if section.entries.is_some() {
+            continue;
+        }
+
+        for key in value.as_table().map(|t| t.keys()).into_iter().flatten() {
+            if !section.options.iter().any(|option| option.key == key.as_str()) {
+                found.push(format!("{}.{}", section.name, key));
+            }
+        }
+    }
+
+    found
 }
 
 // --------------------------------------------------------------------------------------------
@@ -791,15 +808,27 @@ fn temporary_path(path: &Path) -> std::path::PathBuf {
 pub struct Saved {
     /// Die geprüfte Konfiguration, wie sie jetzt in der Datei steht.
     pub cleaned: Table,
-    /// Die Abschnitte, die sich gegenüber `keep` geändert haben.
+    /// Die Abschnitte, die sich gegenüber `previous` geändert haben.
     pub changed: Vec<String>,
+    /// Die Einträge, die beim Schreiben aus der Datei verschwunden sind.
+    ///
+    /// Sie stehen in keinem Schema, das diese Version kennt - die Oberfläche
+    /// zeigt sie nicht an, und niemand liest sie. Sie werden aber samt und sonders
+    /// aus der Datei entfernt, und das gehört gesagt, sonst ist es ein stiller
+    /// Datenverlust.
+    pub dropped: Vec<String>,
 }
 
 /// Eine Konfiguration prüfen und in die Datei schreiben.
 ///
-/// `keep` ist der bisherige Stand: unbekannte Optionen und Abschnitte werden
-/// von dort übernommen und nicht verloren. Der laufende Betrieb wird bewusst
-/// nicht verändert - die Änderungen wirken erst nach einem Neustart.
+/// `previous` ist der Stand, gegen den die Änderungen gemessen werden; er ist der
+/// letzte Stand aus der Datei, nicht der des laufenden Betriebs. Der laufende
+/// Betrieb wird bewusst nicht verändert - die Änderungen wirken erst nach einem
+/// Neustart.
+///
+/// Was das Schema nicht kennt, wird nicht geschrieben, auch dann nicht, wenn es in
+/// der Datei stand (siehe [`unknown`]). Gemessen wird das an der Datei selbst, weil
+/// genau sie überschrieben wird.
 ///
 /// Geschrieben wird über eine temporäre Datei, die geschrieben, zurückgelesen
 /// und verglichen wird, bevor sie die echte Datei ersetzt. So kann ein Fehler
@@ -808,18 +837,22 @@ pub struct Saved {
 pub fn save(
     path: &Path,
     incoming: &Table,
-    keep: &Table,
+    previous: &Table,
 ) -> Result<Saved, Errors> {
-    let (cleaned, errors) = validate(incoming, Some(keep));
+    let (cleaned, errors) = validate(incoming);
     if !errors.is_empty() {
         return Err(errors);
     }
 
     let changed: Vec<String> = SECTIONS
         .iter()
-        .filter(|section| cleaned.get(section.name) != keep.get(section.name))
+        .filter(|section| cleaned.get(section.name) != previous.get(section.name))
         .map(|section| format!("[{}]", section.name))
         .collect();
+
+    // Was beim Schreiben aus der Datei verschwindet, vorher feststellen: danach
+    // steht es nirgends mehr, auch nicht in einem Protokoll.
+    let dropped = read(path).map(|stored| unknown(&stored)).unwrap_or_default();
 
     let temporary = temporary_path(path);
     let write = fs::write(&temporary, dump(&cleaned))
@@ -839,7 +872,7 @@ pub fn save(
     let _ = fs::remove_file(&temporary);
 
     write?;
-    Ok(Saved { cleaned, changed })
+    Ok(Saved { cleaned, changed, dropped })
 }
 
 /// JSON aus der Weboberfläche in eine Konfigurationstabelle umwandeln.
@@ -985,13 +1018,13 @@ fn coerce(option: &OptionSpec, raw: Option<&Val>) -> Result<Val, String> {
 
 /// Konfiguration prüfen und in eine vollständige, speicherbare Form bringen.
 ///
-/// Fehlende Optionen erhalten ihren Standardwert, unbekannte Optionen bleiben erhalten.
-/// `keep` hält die bisherige Konfiguration fest: unbekannte Optionen und Abschnitte,
-/// die die Oberfläche nicht kennt, werden von dort übernommen und nicht verloren.
-/// Liefert (bereinigte Konfiguration, Fehler je Schlüssel `abschnitt.option`).
-pub fn validate(data: &Table, keep: Option<&Table>) -> (Table, Errors) {
+/// Fehlende Optionen erhalten ihren Standardwert. Was das Schema nicht kennt, wird
+/// verworfen: unbekannte Optionen und Abschnitte stehen danach weder in der
+/// geputzten Konfiguration noch in der aus ihr geschriebenen Datei, denn [`dump`]
+/// erzeugt die Datei vollständig aus dem Schema. Liefert (bereinigte
+/// Konfiguration, Fehler je Schlüssel `abschnitt.option`).
+pub fn validate(data: &Table) -> (Table, Errors) {
     let empty = Table::new();
-    let keep = keep.unwrap_or(&empty);
 
     let mut cleaned = Table::new();
     let mut errors = Errors::new();
@@ -1006,8 +1039,6 @@ pub fn validate(data: &Table, keep: Option<&Table>) -> (Table, Errors) {
                 &empty
             }
         };
-
-        let kept: &Table = keep.get(section.name).and_then(|v| v.as_table()).unwrap_or(&empty);
 
         let mut values = Table::new();
 
@@ -1042,9 +1073,7 @@ pub fn validate(data: &Table, keep: Option<&Table>) -> (Table, Errors) {
                 values.insert(key, str_val(&value));
             }
         } else {
-            let mut known: Vec<&str> = Vec::new();
             for option in &section.options {
-                known.push(option.key);
                 match coerce(option, source.get(option.key)) {
                     Ok(value) => {
                         values.insert(option.key.to_string(), value);
@@ -1060,26 +1089,9 @@ pub fn validate(data: &Table, keep: Option<&Table>) -> (Table, Errors) {
                     }
                 }
             }
-
-            // Unbekannte Optionen aus der Oberfläche oder der bisherigen Datei übernehmen.
-            // Bei Eintragstabellen wie [numbers] gibt es keine bekannten Schlüssel -
-            // dort ist der komplette Inhalt aus der Oberfläche maßgeblich, damit
-            // entfernte Einträge auch wirklich verschwinden.
-            for (key, value) in kept.iter().chain(source.iter()) {
-                if !known.contains(&key.as_str()) && !values.contains_key(key) {
-                    values.insert(key.clone(), value.clone());
-                }
-            }
         }
 
         cleaned.insert(section.name.to_string(), Val::Table(values));
-    }
-
-    // Unbekannte Abschnitte ebenfalls nicht verlieren
-    for (name, value) in keep.iter().chain(data.iter()) {
-        if !cleaned.contains_key(name) {
-            cleaned.insert(name.clone(), value.clone());
-        }
     }
 
     (cleaned, errors)
@@ -1237,7 +1249,7 @@ mod tests {
     #[test]
     fn roundtrip() {
         let original = example();
-        let (cleaned, errors) = validate(&original, None);
+        let (cleaned, errors) = validate(&original);
         assert!(errors.is_empty(), "{:?}", errors);
 
         let text = dump(&cleaned);
@@ -1318,7 +1330,7 @@ mod tests {
 
     #[test]
     fn defaults_and_required() {
-        let (empty, errors) = validate(&Table::new(), None);
+        let (empty, errors) = validate(&Table::new());
         let expected: Vec<&str> = vec![
             "sip.host", "sip.user", "sip.pass", "pins.nsi", "pins.nsa", "pins.gabel",
         ];
@@ -1339,23 +1351,53 @@ mod tests {
         if let Some(Val::Table(pins)) = data.get_mut("pins") {
             pins.insert("nsa".to_string(), Val::Int(28));
         }
-        let (_, errors) = validate(&data, None);
+        let (_, errors) = validate(&data);
         assert_eq!(errors.get("sip.host"), Some("Pflichtangabe"));
         assert_eq!(errors.get("pins.nsa"), Some("darf nicht größer als 27 sein"));
     }
 
+    /// Die Datei entsteht vollständig aus dem Schema: was es nicht kennt, steht
+    /// danach weder in der geprüften Konfiguration noch in der Datei - und wird
+    /// benannt, damit der Verlust beim Speichern nicht still bleibt.
     #[test]
-    fn unknown_values_survive() {
-        let (mut data, _) = validate(&example(), None);
-        if let Some(Val::Table(sip)) = data.get_mut("sip") {
+    fn unknown_values_are_dropped() {
+        let (mut data, _) = validate(&example());
+        if let Val::Table(sip) = data.get_mut("sip").unwrap() {
             sip.insert("zusatz".to_string(), Val::Int(42));
         }
-        data.insert("eigener_abschnitt".to_string(), Val::empty_table());
-        if let Some(Val::Table(section)) = data.get_mut("eigener_abschnitt") {
-            section.insert("x".to_string(), str_val("y"));
-        }
-        let (cleaned, errors) = validate(&data, None);
+        let mut special = Table::new();
+        special.insert("x".to_string(), str_val("y"));
+        data.insert("eigener_abschnitt".to_string(), Val::Table(special));
+
+        assert_eq!(
+            unknown(&data),
+            vec!["[eigener_abschnitt]".to_string(), "sip.zusatz".to_string()]
+        );
+
+        let (cleaned, errors) = validate(&data);
         assert!(errors.is_empty());
-        assert_eq!(parse(&dump(&cleaned)).unwrap(), cleaned);
+        assert!(!cleaned.contains_key("eigener_abschnitt"), "unbekannter Abschnitt behalten");
+        assert!(
+            !cleaned["sip"].as_table().unwrap().contains_key("zusatz"),
+            "unbekannte Option behalten"
+        );
+
+        let text = dump(&cleaned);
+        assert!(!text.contains("zusatz"), "unbekannte Option in der Datei");
+        assert!(!text.contains("eigener_abschnitt"), "unbekannter Abschnitt in der Datei");
+        assert_eq!(parse(&text).unwrap(), cleaned);
+    }
+
+    /// Kurzwahlen und Rufnummern haben keine festen Schlüssel: dort ist ein
+    /// unbekannter Eintrag einfach ein unbekannter Kurzbefehl, kein Unbekannter.
+    #[test]
+    fn entry_tables_have_no_unknown_keys() {
+        let (mut data, _) = validate(&example());
+        if let Val::Table(numbers) = data.get_mut("numbers").unwrap() {
+            numbers.insert("42".to_string(), str_val("01299999"));
+        }
+
+        assert!(unknown(&data).is_empty());
+        assert!(dump(&validate(&data).0).contains("\"42\" = \"01299999\""));
     }
 }

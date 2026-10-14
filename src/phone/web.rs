@@ -70,10 +70,17 @@ impl PhoneApi for Arc<Phone> {
         };
 
         let changed = saved.changed;
+        let dropped = saved.dropped;
         println!(
             "Konfiguration gespeichert: {}",
             if changed.is_empty() { "keine Änderungen".to_string() } else { changed.join(", ") }
         );
+
+        // Was beim Schreiben aus der Datei gefallen ist, gehört in den Log und in
+        // die Antwort: es liest niemand mehr, und es wäre sonst spurlos weg.
+        if !dropped.is_empty() {
+            println!("Unbekannte Einträge wurden aus der Datei entfernt: {}", dropped.join(", "));
+        }
 
         *lock(&self.baseline) = saved.cleaned;
         *lock(&self.config_mtime) = modified(&self.options.config).unwrap_or(0.0);
@@ -84,7 +91,12 @@ impl PhoneApi for Arc<Phone> {
             self.config_changed.store(true, Ordering::SeqCst);
         }
 
-        serde_json::json!({ "ok": true, "changed": changed, "restart_required": has_changes })
+        serde_json::json!({
+            "ok": true,
+            "changed": changed,
+            "dropped": dropped,
+            "restart_required": has_changes
+        })
     }
 
     fn run_action(&self, action: Command) {
