@@ -106,13 +106,9 @@ impl PhoneApi for Arc<Phone> {
     }
 
     fn run_action(&self, action: Command) {
-        match action {
-            Command::NightMode => self.start_night_mode(),
-            Command::SleepMusic => self.toggle_sleep_music(),
-            Command::TestLoudspeaker => self.test_loudspeaker(),
-            Command::TestEarpiece => self.test_earpiece(),
-            Command::Reboot => self.reboot(),
-            Command::Shutdown => self.shutdown(),
-        }
+        // The same dispatch the dial uses, so a command cannot be reachable from
+        // one and missing from the other. Whether systemd took a reboot is not
+        // this interface's business - it answers before the action runs.
+        let _ = self.run_command(action);
     }
 }

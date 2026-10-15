@@ -177,6 +177,10 @@ by hand and each failing silently when they drifted:
   and suggests - is derived from the enum. Adding a feature is adding a variant. Worth keeping: an unknown
   target used to fall through to the "place a call" arm, so a typo made the phone dial the typo.
 - **`Timer` is the only way to arm a timed job** (see below).
+- **`Phone::run_command` is the only place a `Command` is carried out.** The web interface reaches it
+  through `PhoneApi::run_action`. It used to be two matches over the same enum, and they had already
+  drifted - only the dial played the confirmation tone - which is the failure mode `command.rs` exists to
+  prevent, in the one place two copies of the dispatch had survived.
 - **`crate::sync::lock()` is the only way to take a mutex.** Sixty-odd call sites said
   `lock().unwrap_or_else(|e| e.into_inner())`, which is noise at every one of them and says nothing. The
   reasoning is in the module: `panic = "abort"` means a release build cannot hit it at all, and under the
@@ -197,6 +201,13 @@ there; what it used to cost is left out.
 - **Contacts are read as edges, not polled** - one request for all three lines with `EdgeDetect::Both`, a
   thread blocked in `Lines::read_event`, and `Watcher` rebuilding the 1 ms `PulseDecoder` grid from the
   kernel timestamps, so a rotation stays decodable during a callback.
+- **A failed `read_event` is retried, not fatal.** The reader thread is the only thing that notices the dial
+  and the hook switch, so ending it on the first error left `Inputs::wait` with nobody to deliver a
+  change, and the phone stayed up while simply ignoring the handset. Retry logs once per run of failures,
+  not once per attempt.
+- **`Inputs::wait` parks forever only when the reader thread is gone**, which cannot happen while a
+  consumer is running. The message says so and says to restart the service, because that is now the
+  remedy.
 - **`advance` drops the tail of a gap over `MAX_SAMPLES`**, keeping only the sub-millisecond remainder in
   `carry`; a truncated gap at constant levels can settle a debounce but never invent a rotation.
 - **No `Drop` on the watcher**: `read_event` blocks in the kernel on a descriptor `Lines` does not expose.
@@ -207,6 +218,13 @@ there; what it used to cost is left out.
   under load instead: brightness is the duty, the frequency only has to stay flicker-free.
 - **Duty 0 or 100 is a plain level**: `timings` clamps and returns `None`, so there is no thread with a
   zero-length half period.
+- **The PWM thread is started with `thread::Builder` and its error is reported**, not `thread::spawn`,
+  which panics - and under `panic = "abort"` a Pi Zero that cannot start one more thread would lose the
+  phone over a dimmed LED. Every other thread in the crate already reports rather than panics.
+- **The PWM loop ignores what `set` returns.** A pin that cannot be written while dimming is therefore
+  silent; that is how it has always been, and the only `GPIO-Ausgang nicht schreibbar` line comes from
+  `Output::set`, which runs once per state change and not once per period. Do not read that line as
+  "thousands of writes failed" - it is one line per call.
 
 ## Audio
 
@@ -253,9 +271,27 @@ there; what it used to cost is left out.
   somebody dials that feature. Go through `self.runtime`; a unit test asserts this textually.
 - **Nothing may block the watcher thread**, since it has to notice the handset going down: waiting work
   goes to `background()`. Dial decoding survives a blocked watcher (the kernel buffers the timestamps),
-  the hook switch does not.
+  the hook switch does not. Every dial-triggered command goes through `background()` for this reason -
+  three of the six wait for a sound to finish, and one waits half a second before it even starts - and a
+  unit test asserts that `run_dial_action` still does.
+- **`Channel::stop` returns only once the sound card is free**, which is what lets the ringback stop before
+  the bridge takes the card. That holds for *concurrent* callers too: the playback is read out of the
+  channel rather than taken, so a second `stop` waits on the same `Done` instead of finding an empty slot
+  and returning while the thread is still holding the device. The slot is cleared afterwards only if it
+  still holds that same sound, so a sound started meanwhile is not stranded.
+- **The playback thread releases its waiters on every way out**, including a panic: `Done::finish` is held
+  by a `Drop` guard. A plain call at the end of the closure is skipped by an unwind, and `Done::wait` has
+  no timeout - every waiter would sit on a condvar nobody signals.
 - **Timers must be aborted, not forgotten**: `Timer::start` cancels first, so a job left by a dropped
   `JoinHandle` is still running with nothing to cancel it.
+- **`CallEnded` names no call**, so `declined_incoming_call` is the only thing that tells `hung_up` the
+  end it is looking at belongs to a call that was declined. It is a global flag, not a per-call marker, so
+  `hung_up` also checks that no conversation is up before acting on it: an incoming call is declined
+  precisely when the handset is off the cradle, which is also when an outgoing call can be running, and
+  tearing that one down on behalf of a call that was never answered left its duration timer armed.
+- **A `systemctl` that fails must not end the process.** `systemctl()` returns whether the request was
+  accepted; reboot and shutdown only exit the process when it was. A missing or refusing `systemctl`
+  otherwise took the phone down mid-call, with no BYE and nothing in the log.
 - **The ringing lock is a wrapping window with midnight inside it**: `from > to` is normal, and a zero
   switches the lock off at the *bounds*. The old `0 < hour` guard kept `to = 0` switched off and left the
   hour between midnight and one o'clock unlocked, so the phone rang at half past midnight.

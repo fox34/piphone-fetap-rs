@@ -193,29 +193,41 @@ impl Output {
 
                 // The output handle is shared with this thread only; `set` takes `&self`.
                 let line = self.line.clone_shared();
-                self.pwm = Some(thread::spawn(move || {
-                    while !stop.load(Ordering::SeqCst) {
-                        let cycle = Instant::now();
+                let spawned = thread::Builder::new()
+                    .name("gpio-pwm".to_string())
+                    .spawn(move || {
+                        while !stop.load(Ordering::SeqCst) {
+                            let cycle = Instant::now();
 
-                        // The on-pulse is measured from the start of the cycle, so
-                        // the duty - the brightness - is what was asked for even
-                        // if the cycle starts late.
-                        line.set(true);
-                        sleep_until(cycle, on_time);
+                            // The on-pulse is measured from the start of the cycle,
+                            // so the duty - the brightness - is what was asked for
+                            // even if the cycle starts late.
+                            line.set(true);
+                            sleep_until(cycle, on_time);
 
-                        // The off-time is measured from the *end* of the on-pulse,
-                        // and this is the part that must not be traded away. A
-                        // sleep can only ever end late, so anchoring the gap to
-                        // the cycle would let an overrun eat into it: once the
-                        // overrun is as long as the gap, the gap closes and the
-                        // LED jumps to full brightness until the next cycle. That
-                        // showed up as a visibly varying light level, because how
-                        // much of the gap survived depended on whatever else the
-                        // CPU was doing.
-                        line.set(false);
-                        sleep_until(Instant::now(), off_time);
-                    }
-                }));
+                            // The off-time is measured from the *end* of the
+                            // on-pulse, and this is the part that must not be
+                            // traded away. A sleep can only ever end late, so
+                            // anchoring the gap to the cycle would let an overrun
+                            // eat into it: once the overrun is as long as the gap,
+                            // the gap closes and the LED jumps to full brightness
+                            // until the next cycle. That showed up as a visibly
+                            // varying light level, because how much of the gap
+                            // survived depended on whatever else the CPU was doing.
+                            line.set(false);
+                            sleep_until(Instant::now(), off_time);
+                        }
+                    });
+
+                match spawned {
+                    Ok(handle) => self.pwm = Some(handle),
+                    // Every other thread in the crate reports a failed spawn
+                    // rather than panicking on it. `thread::spawn` panics, and the
+                    // release profile is `panic = "abort"`, so a Pi Zero that
+                    // cannot start one more thread would lose the phone over a
+                    // dimmed LED.
+                    Err(e) => eprintln!("PWM-Thread nicht startbar: {}", e),
+                }
             }
         }
     }

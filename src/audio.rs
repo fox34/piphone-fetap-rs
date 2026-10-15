@@ -72,6 +72,10 @@ pub struct Channel {
 }
 
 /// A sound being played, from the point of view of the threads waiting for it.
+///
+/// Cloneable because [`Channel::stop`] has to look at the playback without
+/// taking it out of the channel.
+#[derive(Clone)]
 struct Playback {
     /// Set by [`Channel::stop`] to make the playback thread finish early.
     stop: Arc<AtomicBool>,
@@ -107,6 +111,25 @@ impl Done {
         while !*finished {
             finished = self.signal.wait(finished).unwrap_or_else(|e| e.into_inner());
         }
+    }
+}
+
+/// Calls [`Done::finish`] when it goes out of scope, however that happens.
+///
+/// The playback thread has to release everyone waiting on it on *every* way
+/// out, and a plain call at the end of the closure only covers the one where it
+/// returns normally. A panic inside `play` or `play_tone` unwinds straight past
+/// such a call, and then `Done::wait` - which waits without a timeout - never
+/// returns: the thread that called `stop` is stuck holding the phone hostage
+/// until the process dies for some other reason. Under the release profile
+/// `panic = "abort"` ends the process instead, so the wait never gets the
+/// chance to hang there; the development and test profiles do unwind, and there
+/// it would.
+struct FinishOnDrop(Arc<Done>);
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        self.0.finish();
     }
 }
 
@@ -161,14 +184,15 @@ impl Channel {
         let result = std::thread::Builder::new()
             .name(format!("audio-{}", channel))
             .spawn(move || {
+                // Released when the closure ends, including when it unwinds.
+                let _release = FinishOnDrop(finished);
+
                 let outcome = body(&flag);
                 if let Err(e) = outcome {
                     // Nothing to do but report: the caller has already moved
                     // on, and a missing sound must not take the phone down.
                     println!("Klang {} konnte nicht abgespielt werden: {}", label, e);
                 }
-                // Release anyone waiting in `wait` or `stop`.
-                finished.finish();
             });
 
         match result {
@@ -181,18 +205,28 @@ impl Channel {
     }
 
     /// Stop whatever is playing on this channel.
+    ///
+    /// Returns once the sound card is free, so a caller that starts the next
+    /// sound straight afterwards does not race the old stream for the device.
     pub fn stop(&self) {
-        // Take the playback out before signalling it: waiting for the thread
-        // below must not hold the lock, or `wait` could never see the thread
-        // finish.
-        let playback = lock(&self.playback).take();
+        // The playback is *read*, not taken: taking it would let a second
+        // caller find an empty slot and return while the thread below is still
+        // holding the card, which is the one moment this has to be right in.
+        // Every caller that arrives while a stop is in progress waits on the
+        // same `Done` and so returns at the same moment.
+        let playback = lock(&self.playback).clone();
         if let Some(playback) = playback {
             playback.stop.store(true, Ordering::SeqCst);
-            // Wait for the thread to release the sound card before returning. A
-            // caller that starts the next sound straight away must not race the
-            // old stream for the device. The thread signals once it is done,
-            // which is as soon as its current ALSA write returns.
+            // The thread signals once it is done, which is as soon as its
+            // current ALSA write returns.
             playback.done.wait();
+            // Clear the slot only if this playback is still the one in it: a
+            // sound started while we waited has put its own there, and taking
+            // that one out would strand its `Done`.
+            let mut slot = lock(&self.playback);
+            if slot.as_ref().is_some_and(|current| Arc::ptr_eq(&current.done, &playback.done)) {
+                *slot = None;
+            }
         }
     }
 
@@ -417,8 +451,6 @@ fn drain(pcm: &alsa::pcm::PCM, stop: &AtomicBool) -> Result<(), String> {
     }
 }
 
-/// Hand one decoded buffer to ALSA as interleaved i16.
-#[cfg(target_os = "linux")]
 /// Hand one decoded buffer to ALSA as interleaved i16, through `converted`.
 ///
 /// `converted` is refilled rather than reallocated: it is the same buffer for
@@ -930,6 +962,113 @@ mod tests {
         channel.stop();
         channel.wait();
         assert!(!channel.is_playing());
+    }
+
+    /// A second `stop` must wait for the same thread as the first one did.
+    ///
+    /// Taking the playback out of the channel made the second caller see an
+    /// empty slot and return at once - before the playback thread had let go of
+    /// the sound card. The caller that starts the next sound straight after
+    /// would then race the old stream for the device, which is exactly what
+    /// this method exists to prevent.
+    #[test]
+    fn a_second_stop_waits_for_the_same_thread_as_the_first() {
+        let channel = Arc::new(Channel::default());
+        let (stop, done) = fake_sound(&channel);
+
+        // The playback thread notices the request only after a moment, which is
+        // what finishing the current ALSA write looks like.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            stop.store(true, Ordering::SeqCst);
+            done.finish();
+        });
+
+        // Both callers must come back after the card was actually freed. If the
+        // second one returned early it would land here while the sound is still
+        // playing.
+        let second = {
+            let channel = channel.clone();
+            std::thread::spawn(move || channel.stop())
+        };
+        channel.stop();
+        second.join().unwrap();
+
+        assert!(!channel.is_playing(), "der zweite stop kam vor dem Freigeben zurück");
+        release.join().unwrap();
+    }
+
+    /// A sound that starts *while* a `stop` is waiting must survive that stop.
+    ///
+    /// The stop holds a reference to the sound it is stopping, and clears the
+    /// channel once that sound has let go. A newer sound that took the channel
+    /// in the meantime must not be cleared with it: its own `Done` would be
+    /// stranded, and a later `wait` would return at once instead of waiting for
+    /// a sound that is still playing.
+    #[test]
+    fn a_stop_in_progress_does_not_take_the_sound_that_replaced_it() {
+        let channel = Arc::new(Channel::default());
+        let (old_stop, old_done) = fake_sound(&channel);
+
+        let (started, ready) = mpsc::channel();
+        let stopper = {
+            let channel = channel.clone();
+            std::thread::spawn(move || {
+                started.send(()).unwrap();
+                // Blocks in `Done::wait` until the sound below lets go.
+                channel.stop();
+            })
+        };
+        ready.recv().unwrap();
+        // Long enough for the stop to have read the channel and taken the old
+        // sound's reference; all it does in between is that read and the store.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // A new sound starts while the old one is still being stopped.
+        let (_new_stop, new_done) = fake_sound(&channel);
+
+        // The old sound lets go, so the stop finishes and reaches the clear.
+        old_stop.store(true, Ordering::SeqCst);
+        old_done.finish();
+        stopper.join().unwrap();
+
+        assert!(channel.is_playing(), "der neue Klang wurde aus dem Kanal geräumt");
+        assert!(!new_done.is_finished());
+
+        // And waiting on it really waits for *it*, not for the old sound.
+        let (waiter, rx) = waiting_on(&channel);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "der wartende Thread kam vor dem neuen Klang zurück"
+        );
+        new_done.finish();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "waited");
+        waiter.join().unwrap();
+    }
+
+    /// The completion signal has to be released however the playback thread ends.
+    ///
+    /// A plain call at the end of the closure is skipped by a panic, and then
+    /// every waiter - `wait` and `stop` alike - sits on a condvar that nobody
+    /// will ever signal.
+    #[test]
+    fn a_panicking_playback_thread_still_releases_its_waiters() {
+        let channel = Arc::new(Channel::default());
+        let done = Arc::new(Done::default());
+
+        let thread = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let _release = FinishOnDrop(done);
+                panic!("playback blew up");
+            })
+        };
+        assert!(thread.join().is_err(), "der Thread sollte paniken");
+
+        // The point of the guard: the wait ends instead of hanging forever.
+        done.wait();
+        assert!(done.is_finished());
+        let _ = channel;
     }
 
     #[test]

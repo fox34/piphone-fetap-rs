@@ -103,6 +103,14 @@ pub struct Phone {
     started_at: Instant,
     is_connected: AtomicBool,
     call_incoming: AtomicBool,
+    /// An incoming call was turned away without ever ringing.
+    ///
+    /// `SipEvent::CallEnded` names no call, so this is the only thing that tells
+    /// [`Phone::hung_up`] the end it is looking at belongs to a call that was
+    /// declined rather than to one that was answered. It is a plain flag and not
+    /// a per-call marker, so it says "an end is coming that needs no cleanup"
+    /// rather than which end that is; `hung_up` therefore also checks that no
+    /// conversation is up before it acts on it.
     declined_incoming_call: AtomicBool,
     manual_dnd: AtomicBool,
     sleep_music_running: AtomicBool,
@@ -471,29 +479,65 @@ impl Phone {
             return;
         };
 
-        self.run_command(command);
+        // The dial confirms a feature with a sound, so whoever dialled it knows
+        // it registered without having to look at the phone.
+        let confirm = command == Command::NightMode;
+
+        // All of it goes to the blocking pool. The dial runs on the GPIO watcher
+        // thread, and three of the commands wait for a sound to finish - one of
+        // them for the deliberate half-second pause in front of the earpiece
+        // test - which would hold that thread, and with it the hook switch, for
+        // the length of the sound.
+        self.background(move |phone| {
+            if !phone.run_command(command) {
+                // Reboot and shutdown are the only commands that can report a
+                // failure, and they have no next step: the process goes with the
+                // machine rather than waiting to be taken away. Only once systemd
+                // has actually accepted the request - otherwise this would end a
+                // phone that is still very much running.
+                return;
+            }
+
+            if matches!(command, Command::Reboot | Command::Shutdown) {
+                std::process::exit(0);
+            }
+
+            if confirm {
+                phone.audio.play_speaker(&phone.sound(Sound::Confirm)).wait();
+            }
+        });
     }
 
     /// Carry out one command, whichever name it arrived under.
-    fn run_command(self: &Arc<Self>, command: Command) {
+    ///
+    /// The single place a [`Command`] is carried out; the web interface reaches
+    /// it through [`PhoneApi::run_action`]. It used to be two matches over the
+    /// same enum, and they had already drifted: only the dial played the
+    /// confirmation tone, so adding a command meant editing both.
+    ///
+    /// Returns whether the command was carried out. It is `false` only for a
+    /// [`Phone::reboot`] or [`Phone::shutdown`] that systemd refused; the web
+    /// interface has no use for that, the dial does.
+    fn run_command(self: &Arc<Self>, command: Command) -> bool {
         match command {
             Command::NightMode => {
                 self.start_night_mode();
-                self.background(|phone| {
-                    phone.audio.play_speaker(&phone.sound(Sound::Confirm)).wait()
-                });
+                true
             }
-            Command::SleepMusic => self.toggle_sleep_music(),
-            Command::TestLoudspeaker => self.test_loudspeaker(),
-            Command::TestEarpiece => self.test_earpiece(),
-            Command::Reboot => {
-                self.reboot();
-                std::process::exit(0);
+            Command::SleepMusic => {
+                self.toggle_sleep_music();
+                true
             }
-            Command::Shutdown => {
-                self.shutdown();
-                std::process::exit(0);
+            Command::TestLoudspeaker => {
+                self.test_loudspeaker();
+                true
             }
+            Command::TestEarpiece => {
+                self.test_earpiece();
+                true
+            }
+            Command::Reboot => self.reboot(),
+            Command::Shutdown => self.shutdown(),
         }
     }
 
@@ -733,24 +777,36 @@ impl Phone {
     /// A call ended, either by us or by the other side.
     fn hung_up(self: &Arc<Self>) {
         println!("Anruf beendet");
+
+        // Whether this is the end of a call we declined ourselves, which never
+        // rang and never started a timer.
+        let declined = self.declined_incoming_call.swap(false, Ordering::SeqCst);
+
+        // `CallEnded` carries no call id, so this cannot know *which* call ended
+        // - and an incoming call is declined precisely when the handset is off the
+        // cradle, which is also when an outgoing call can be up. Tearing the
+        // conversation down here on behalf of a call that was never answered is
+        // what used to happen: `call_up` went false while the call was still
+        // live, and the duration timer stayed armed until it cut the
+        // conversation off mid-sentence.
+        if declined && self.call_up.load(Ordering::SeqCst) {
+            return;
+        }
+
         self.call_up.store(false, Ordering::SeqCst);
 
         let was_ringing = self.call_incoming.swap(false, Ordering::SeqCst);
         self.stop_ring_timeout();
         *lock(&self.pending_call) = None;
 
-        // A call we already declined needs no further cleanup.
-        if self.declined_incoming_call.swap(false, Ordering::SeqCst) {
-            return;
-        }
-
         self.audio.stop_speaker();
         self.stop_call_duration_timer();
 
         // The handset is off the cradle: it is waiting for the next number. The
         // tone repeats until the handset goes back down, so it does not run out
-        // while nobody is there to pick it up again.
-        if !was_ringing && !self.is_hungup() {
+        // while nobody is there to pick it up again. Not for a call that was
+        // declined on its way in - nobody is waiting for a number there.
+        if !declined && !was_ringing && !self.is_hungup() {
             self.audio.play_earpiece_tone(Tone::Besetzt);
         }
     }
@@ -957,10 +1013,15 @@ impl Phone {
     }
 
     /// Reboot the phone after playing a tone.
-    pub fn reboot(&self) {
+    ///
+    /// Returns whether the request was accepted. The caller must not end the
+    /// process when it was not: `systemctl` can be missing, or refuse, and
+    /// exiting anyway took the phone down in the middle of a call, with no BYE
+    /// and nothing in the log to say why.
+    pub fn reboot(&self) -> bool {
         println!("Starte System neu.");
         self.audio.play_speaker(&self.sound(Sound::Reboot)).wait();
-        let _ = std::process::Command::new("systemctl").args(["reboot", "-i"]).status();
+        systemctl(&["reboot", "-i"])
     }
 
     /// Restart the service, so that a new configuration takes effect.
@@ -969,17 +1030,17 @@ impl Phone {
 
         std::thread::spawn(|| {
             std::thread::sleep(RESTART_DELAY);
-            let _ = std::process::Command::new("systemctl")
-                .args(["restart", "--no-block", SERVICE])
-                .status();
+            systemctl(&["restart", "--no-block", SERVICE]);
         });
     }
 
     /// Power the phone down after playing a tone.
-    pub fn shutdown(&self) {
+    ///
+    /// Returns whether the request was accepted; see [`Phone::reboot`].
+    pub fn shutdown(&self) -> bool {
         println!("Fahre System herunter.");
         self.audio.play_speaker(&self.sound(Sound::Shutdown)).wait();
-        let _ = std::process::Command::new("systemctl").args(["poweroff", "-i"]).status();
+        systemctl(&["poweroff", "-i"])
     }
 
     // ---------------------------------------------------------------- watchdog
@@ -1133,6 +1194,31 @@ fn sip_bind_addr() -> std::net::SocketAddr {
     ([0, 0, 0, 0], 5060).into()
 }
 
+/// Ask systemd to do something, and report whether it did.
+///
+/// The three callers are the ones that change the machine's power state or
+/// replace this process, and all three used to throw the exit status away. That
+/// matters most for reboot and shutdown: the dial then ended the process
+/// unconditionally, so a `systemctl` that was missing - or that refused, because
+/// the unit was masked or the system was not systemd-managed - left the phone
+/// exiting in the middle of a call with nothing to say so.
+///
+/// A restart that fails is not fatal, so it only gets logged; a reboot that fails
+/// leaves a running phone, which is the better of the two outcomes.
+fn systemctl(args: &[&str]) -> bool {
+    match std::process::Command::new("systemctl").args(args).status() {
+        Ok(status) if status.success() => true,
+        Ok(status) => {
+            eprintln!("systemctl {} ist mit Status {} fehlgeschlagen.", args.join(" "), status);
+            false
+        }
+        Err(e) => {
+            eprintln!("systemctl {} nicht startbar: {}", args.join(" "), e);
+            false
+        }
+    }
+}
+
 /// How long the phone rings before giving up on an incoming call.
 const RING_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1170,6 +1256,8 @@ fn section_mut<'a>(config: &'a mut Table, name: &str) -> Option<&'a mut BTreeMap
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// Every feature here is triggered from the rotary dial, and the dial is
     /// decoded on the GPIO watcher thread — a plain OS thread with no reactor.
     /// A bare `tokio::spawn` or `spawn_blocking` on that path panics at runtime
@@ -1198,5 +1286,44 @@ mod tests {
                 what
             );
         }
+    }
+
+    /// A command must not be waiting for a sound on the GPIO watcher thread.
+    ///
+    /// Three of the six commands block: the two test tones wait for the sound to
+    /// finish, and the earpiece test waits half a second before it even starts.
+    /// Running any of them on the watcher thread holds that thread, and with it
+    /// the hook switch, for the length of the sound - lifting the handset does
+    /// nothing for as long as the tone plays. So every dial-triggered command
+    /// goes through `background()`.
+    ///
+    /// Textual, like the check above: the blocking only shows with a sound card.
+    #[test]
+    fn a_dial_command_does_not_run_on_the_watcher_thread() {
+        let source = include_str!("mod.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("Quelle vor den Tests");
+
+        let dial = source
+            .split("fn run_dial_action")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }").next())
+            .expect("run_dial_action");
+        assert!(
+            dial.contains("self.background("),
+            "run_dial_action führt einen Befehl direkt aus; er gehört über background(), \
+             sonst wartet der Wählscheiben-Thread mit."
+        );
+    }
+
+    /// A `systemctl` that cannot run must be reported as a failure.
+    ///
+    /// The dial ends the process after a reboot or a shutdown, and it used to do
+    /// so unconditionally - so a missing or refusing `systemctl` took the phone
+    /// down in the middle of a call, with no BYE and nothing in the log.
+    #[test]
+    fn a_systemctl_that_cannot_run_reports_failure() {
+        assert!(!systemctl(&["this-subcommand-does-not-exist"]));
     }
 }

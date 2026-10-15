@@ -1,0 +1,32 @@
+# Formatting for this crate.
+#
+# `cargo fmt` is advisory here, not enforced: `cargo fmt --check` is clean on
+# nothing, and the reason is worth writing down rather than rediscovering.
+#
+# `max_width = 120` is the part that matters. The default is 100, and this crate
+# writes function signatures and `let` bindings on one line well past that -
+# dropping to 100 alone takes the reported diffs from 144 to 262.
+#
+# What is left after that is not a width problem. Most of it is method chains
+# written vertically:
+#
+#     let name = path.file_name()
+#         .map(|n| n.to_string_lossy().to_string())
+#         .unwrap_or_default();
+#
+# Each of those lines is short, so rustfmt joins them back into one line and
+# reports a diff. There is no stable option that means "keep the line breaks the
+# author wrote" - rustfmt has no opinion about manual breaks inside an
+# expression, and `chain_width` only moves the threshold, which trades this
+# complaint for the opposite one (it starts splitting chains the author kept on
+# one line; every value between 20 and 119 was measured and all of them report
+# more diffs than 120 does).
+#
+# Making the check pass would therefore mean either reformatting the crate once
+# and accepting the joined chains, or putting `#[rustfmt::skip]` on the
+# individual expressions. Both are a separate decision from a bug fix, so this
+# file only sets the width and leaves the formatting as it is.
+#
+# `wrap_comments` is deliberately absent: it is nightly-only, and asking for it
+# on stable prints a warning on every `cargo fmt` run.
+max_width = 120

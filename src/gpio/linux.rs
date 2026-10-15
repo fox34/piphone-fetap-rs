@@ -114,18 +114,41 @@ impl Levels {
     }
 }
 
+/// How long to wait before reading again after `read_event` failed.
+///
+/// Short enough that a read which recovers is not missed, long enough that a
+/// line which really is gone does not turn into a spin.
+const READ_RETRY: Duration = Duration::from_millis(100);
+
 /// Block on the line request and report every level change.
+///
+/// A failed read is retried rather than treated as the end: this thread is the
+/// only thing that notices the dial and the hook switch, and ending it on the
+/// first error left [`Inputs::wait`] with nobody to deliver a change, so the
+/// consumer waited on a channel that would never produce anything. The phone
+/// stayed up and simply stopped answering the handset.
 fn read_edges(
     mut lines: Lines<gpiod::Input>,
     levels: Arc<Mutex<Levels>>,
     sender: mpsc::Sender<Change>,
 ) {
+    // Whether the current run of failures has already been reported, so a line
+    // that is gone produces one line per retry rather than ten a second.
+    let mut reported = false;
+
     loop {
         let event = match lines.read_event() {
-            Ok(event) => event,
+            Ok(event) => {
+                reported = false;
+                event
+            }
             Err(e) => {
-                eprintln!("GPIO-Flanken nicht lesbar: {}", e);
-                return;
+                if !reported {
+                    eprintln!("GPIO-Flanken nicht lesbar, versuche es erneut: {}", e);
+                    reported = true;
+                }
+                thread::sleep(READ_RETRY);
+                continue;
             }
         };
 
@@ -178,9 +201,17 @@ impl Inputs {
         let first = match self.changes.recv_timeout(timeout) {
             Ok(first) => first,
             Err(RecvTimeoutError::Timeout) => return Vec::new(),
+            // The reader thread only ends when every consumer has gone, which
+            // cannot happen while this one is running. Parking is the only thing
+            // left to do, and it is what the message says: the phone stays up and
+            // the dial and the hook switch are done, so the service has to be
+            // restarted by hand.
             Err(RecvTimeoutError::Disconnected) => {
                 if !self.reported.swap(true, Ordering::SeqCst) {
-                    eprintln!("GPIO-Flanken abgebrochen, der Wählscheiben-Thread wartet.");
+                    eprintln!(
+                        "GPIO-Flanken abgebrochen: Wählscheibe und Hörer werden nicht mehr erkannt. \
+                         Bitte den Dienst neu starten."
+                    );
                 }
                 loop {
                     thread::park();
