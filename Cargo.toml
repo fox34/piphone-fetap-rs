@@ -135,7 +135,6 @@ required-features = ["harness"]
 
 # https://github.com/johnthagen/min-sized-rust
 [profile.release]
-opt-level = "s"     # Optimize for *speed*
 lto = true          # Enable link-time optimization
 codegen-units = 1   # Reduce number of codegen units to increase optimizations
 panic = 'abort'     # Abort on panic

@@ -48,6 +48,7 @@ A sample feature-complete configuration file is provided in `support/config-exam
 - Access to a Raspberry Pi Zero 2W with wired-up hardware can be provided for production testing.
 - Access to a Raspberry Pi 5 with 4GB of RAM can be provided for compiling the production version.
 - Avoid compiling debug binaries on the Raspberry Pi 5 for efficiency reasons.
+- Do not complain about missing CI.
 
 The Pi Zero cannot compile this; memory is too small for `rustc` on the `rvoip` dependency tree. Build on
 a larger machine (see AGENTS.override.md) and copy the binary over: `cargo build --release`.
