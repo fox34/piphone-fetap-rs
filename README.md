@@ -247,7 +247,13 @@ auch eine Aufwachlicht-LED konfiguriert werden.
 Die Spieluhr stoppt, sobald der Hörer abgehoben wird.
 
 
-# Kompilieren
+# Installation
+
+### Debian-Paket
+
+`.deb`-Pakete steht auf GitHub als Release bereit.
+
+### Selbst kompilieren
 
 Kompilieren muss auf einem Linux-System (z.B. Debian Trixie) durchgeführt werden.
 Der Pi Zero 2W hat zu wenig Arbeitsspeicher und der Prozess wäre sehr langsam.

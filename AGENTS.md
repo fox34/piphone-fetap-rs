@@ -61,6 +61,16 @@ of the previous binary (stage, checksum, atomic rename, then restart), and refus
 call is in progress unless `--force` is given. `--no-restart` installs without touching the running
 service, `--skip-build` redeploys the binary already built on the Pi 5.
 
+`scripts/package-deb.sh` builds a `.deb` from the same sources instead of copying files around: it
+takes the release binary (from the build host with `--from`, from `target/` or with `--build`), the
+default sounds from `support/sounds`, `support/config-example.toml` as a conffile and the units from
+`support/etc/`. A `.deb` is an `ar` archive, so it is assembled with `ar`, `tar` and `gzip` and the
+script runs on macOS too; `dpkg-deb` verifies the result where it exists. The `ring-NN` files in
+`support/sounds/ringtones` are not installed by default, because which caller number rings with which
+file is a decision of whoever installs: `--ringtone <Rufnummer>=<datei>` maps one, and the script
+names the ones it leaves out. The sleep music is deliberately not packaged - those titles are
+third-party works.
+
 # Layout
 
 | Path | Contents |
