@@ -172,7 +172,6 @@ const DUTY_MAX: f64 = 100.0;
 const PHONE_PATTERN: &str = r"\+?[0-9][0-9 +()/.\-]*";
 const TIME_PATTERN: &str = r"(?:[01]\d|2[0-3]):[0-5]\d";
 const DIAL_CODE_PATTERN: &str = r"^\d{1,5}$";
-const FILE_PATTERN: &str = r"^\S.*\S|\S$";
 const BARE_KEY_PATTERN: &str = r"^[A-Za-z_][A-Za-z0-9_-]*$";
 
 /// Compile a pattern once, on first use.
@@ -312,7 +311,7 @@ impl OptionSpec {
     }
 }
 
-/// Freie Schlüssel/Wert-Paare einer Tabelle, z.B. `[numbers]` oder `[ringtones]`.
+/// Freie Schlüssel/Wert-Paare einer Tabelle, z.B. `[numbers]`.
 #[derive(Debug)]
 pub struct Entries {
     pub key_label: &'static str,
@@ -436,57 +435,6 @@ pub static SECTIONS: LazyLock<Vec<SectionSpec>> = LazyLock::new(|| {
                 choices: &crate::command::DIAL_NAMES,
             }),
         },
-        SectionSpec {
-            name: "ringtones",
-            title: "Klingeltöne",
-            options: Vec::new(),
-            entries: Some(Entries {
-                key_label: "Rufnummer",
-                value_label: "Klingelton-Datei",
-                comment: &[
-                    "Rufnummerspezifische Klingeltöne. Fehlt eine Rufnummer,",
-                    "wird der generische Klingelton aus [sounds] verwendet.",
-                ],
-                key_pattern: PHONE_PATTERN,
-                value_pattern: Some(FILE_PATTERN),
-                key_message: "Siehe Kommentar",
-                value_message: "Pfad zur Klangdatei angeben.",
-                choices: &[],
-            }),
-        },
-        SectionSpec::options_section(
-            "sounds",
-            "Klänge",
-            vec![
-                OptionSpec::new("boot", "Start", ValueType::String)
-                    .default(str_val(""))
-                    .comment(&["Klang beim Start des Telefons."]),
-                OptionSpec::new("reboot", "Neustart", ValueType::String)
-                    .default(str_val(""))
-                    .comment(&["Klang vor einem Neustart."]),
-                OptionSpec::new("shutdown", "Herunterfahren", ValueType::String)
-                    .default(str_val(""))
-                    .comment(&["Klang vor dem Herunterfahren."]),
-                OptionSpec::new("ring", "Klingeln", ValueType::String)
-                    .default(str_val(""))
-                    .comment(&["Generischer Klingelton."]),
-                OptionSpec::new("test_earpiece", "Test Hörer", ValueType::String)
-                    .default(str_val(""))
-                    .comment(&["Testton über den Hörer."]),
-                OptionSpec::new("test_loud", "Test Lautsprecher", ValueType::String)
-                    .default(str_val(""))
-                    .comment(&["Testton über den Lautsprecher."]),
-                OptionSpec::new("action_confirmed", "Bestätigung", ValueType::String)
-                    .default(str_val(""))
-                    .comment(&["Klang zur Bestätigung eines Kurzbefehls."]),
-                OptionSpec::new("sleep_music", "Einschlafmusik", ValueType::List)
-                    .default(Val::List(Vec::new()))
-                    .items("Ein Pfad je Zeile")
-                    .comment(&[
-                        "Einschlafmusik: mehrere Dateien werden in zufälliger Reihenfolge abgespielt.",
-                    ]),
-            ],
-        ),
         SectionSpec::options_section(
             "misc",
             "Nacht- und Aufwachlicht",
@@ -1324,7 +1272,7 @@ mod tests {
             text.lines().filter(|l| l.starts_with('[')).collect();
         assert_eq!(
             sections,
-            vec!["[network]", "[sip]", "[pins]", "[numbers]", "[ringtones]", "[sounds]", "[misc]", "[web]"]
+            vec!["[network]", "[sip]", "[pins]", "[numbers]", "[misc]", "[web]"]
         );
     }
 

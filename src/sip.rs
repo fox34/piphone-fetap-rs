@@ -149,8 +149,9 @@ fn explain(error: &rvoip::sip::SessionError) -> String {
 
 /// Split a caller identity such as `sip:+49891234@10.0.0.1` down to the number.
 ///
-/// SIP headers carry the full URI; the whitelist and ringtones in the
-/// configuration are keyed by plain numbers, so only the user part is kept.
+/// SIP headers carry the full URI; the whitelist is keyed by plain numbers and
+/// the ringtone for a caller is looked up by the digits in its file name, so
+/// only the user part is kept.
 pub fn caller_number(from: &str) -> String {
     let mut uri = from.trim();
 

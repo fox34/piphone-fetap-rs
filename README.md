@@ -171,6 +171,7 @@ sudo systemctl enable --now i2s-silence.service
 piphone [Optionen]
 
   -c, --config <DATEI>   Pfad zur Konfigurationsdatei (Standard: /usr/local/etc/piphone/config.toml)
+      --sounds <ORDNER>  Verzeichnis der Klangdateien (Standard: /usr/local/share/piphone/sounds)
       --ignore-dnd       Nicht stören für Testzwecke deaktivieren
       --no-web           Webserver zur Steuerung nicht starten
       --silent-boot      Keinen Start-Sound abspielen
@@ -192,6 +193,29 @@ sudo vim /usr/local/etc/piphone/config.toml
 
 Beim Speichern aus der Weboberfläche heraus wird die Datei vollständig aus dem Schema neu geschrieben, Kommentare und
 unbekannte Konfigurationsoptionen werden dabei entfernt.
+
+## Töne
+
+Töne werden in der Weboberfläche unter **Konfiguration** im Abschnitt **Klänge**
+hochgeladen und unter `/usr/local/share/piphone/sounds` (Option `--sounds`) abgelegt.
+Unterstützt werden WAV- und MP3-Dateien.
+
+| Klang | Datei |
+| :--- | :--- |
+| Start | `boot.wav` |
+| Neustart | `reboot.wav` |
+| Herunterfahren | `shutdown.wav` |
+| Klingeln | `ringtone.wav` |
+| Test Lautsprecher | `test-loud.wav` |
+| Test Hörer | `test-earpiece.wav` |
+| Bestätigung | `confirm.wav` |
+
+**Rufnummerspezifische Klingeltöne** und **Einschlafmusik** können beliebig hinzugefügt werden:
+
+| Datei | Bedeutung |
+| :--- | :--- |
+| `ringtones/ringtone-<Rufnummer>` | Klingelton nur für diese Rufnummer, z.B. `ringtone-08912345.wav` |
+| `sleep/<beliebig>` | Titel der Einschlafmusik; alle Titel zusammen werden bei jedem Start neu gemischt und mindestens 15 Minuten gespielt |
 
 
 # Sonderfunktionen

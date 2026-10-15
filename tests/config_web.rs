@@ -275,38 +275,26 @@ fn rejects_invalid_input_and_leaves_the_file_untouched() {
     assert!(!temporary.exists(), "temporäre Datei zurückgeblieben");
 }
 
+/// The ringtones are uploaded files and not options: the form does not offer a
+/// section for them any more, and one that is sent anyway does not come back.
 #[test]
-fn edits_ringtones() {
+fn ringtones_cannot_come_back_through_the_form() {
     let (_dir, path) = workspace();
     let phone = FilePhone::new(&path);
 
-    let form = as_browser_sends(
-        &schema_of(&phone),
-        &json!({
-            "ringtones": {
-                "08912345": "/usr/local/share/piphone/sounds/ring-02.wav",
-                "01701234567": "/usr/local/share/piphone/sounds/ring-03.wav"
-            }
-        }),
-    );
+    // What the browser builds from the schema.
+    let mut form = as_browser_sends(&schema_of(&phone), &json!({}));
+    assert!(form.get("ringtones").is_none(), "das Formular bietet Klingeltöne an");
+
+    // And one that is sent anyway is dropped rather than written.
+    form["ringtones"] = json!({ "08912345": "/usr/local/share/piphone/sounds/ring-02.wav" });
     let (ok, _, _, _) = save(&phone, &form);
-    assert!(ok);
+    assert!(ok, "ein unbekannter Abschnitt darf das Speichern nicht verhindern");
 
-    let ringtones = phone.stored().get("ringtones").unwrap().as_table().unwrap().clone();
-    assert_eq!(ringtones["01701234567"].to_display_string(), "/usr/local/share/piphone/sounds/ring-03.wav");
-
-    // A number starting with 0 needs quoting in TOML.
-    let text = std::fs::read_to_string(&path).unwrap();
-    assert!(text.contains("\"01701234567\""), "Schlüssel nicht quotiert:\n{}", text);
-
-    // A ringtone without a file is refused.
-    let form = as_browser_sends(&schema_of(&phone), &json!({ "ringtones": { "08912345": "" } }));
-    let (ok, _, _, result) = save(&phone, &form);
-    assert!(!ok);
+    assert!(!phone.stored().contains_key("ringtones"), "Abschnitt zurückgekehrt");
     assert!(
-        result["errors"].get("ringtones.08912345").is_some(),
-        "{}",
-        result["errors"]
+        !std::fs::read_to_string(&path).unwrap().contains("[ringtones]"),
+        "Klingeltöne stehen wieder in der Datei"
     );
 }
 
@@ -317,22 +305,16 @@ fn edits_lists() {
 
     let form = as_browser_sends(
         &schema_of(&phone),
-        &json!({ "sounds": { "sleep_music": ["/opt/a.mp3", "/opt/b.mp3", "/opt/c.mp3"] } }),
+        &json!({ "misc": { "wake_up_times": ["05:00", "05:00", "05:00", "05:00", "05:00", "06:00", "06:00"] } }),
     );
     let (ok, _, _, _) = save(&phone, &form);
     assert!(ok);
 
     let stored = phone.stored();
     assert_eq!(
-        config::option_list(&stored, "sounds", "sleep_music"),
-        vec!["/opt/a.mp3", "/opt/b.mp3", "/opt/c.mp3"]
+        config::option_list(&stored, "misc", "wake_up_times"),
+        vec!["05:00", "05:00", "05:00", "05:00", "05:00", "06:00", "06:00"]
     );
-
-    // An empty list is a valid way to switch the feature off.
-    let form = as_browser_sends(&schema_of(&phone), &json!({ "sounds": { "sleep_music": [] } }));
-    let (ok, _, _, _) = save(&phone, &form);
-    assert!(ok);
-    assert!(config::option_list(&phone.stored(), "sounds", "sleep_music").is_empty());
 }
 
 #[test]
@@ -374,9 +356,11 @@ fn written_file_carries_the_generated_comments() {
         "Hinweis auf verlorene Kommentare fehlt"
     );
 
-    for section in ["network", "sip", "pins", "numbers", "ringtones", "sounds", "misc", "web"] {
+    for section in ["network", "sip", "pins", "numbers", "misc", "web"] {
         assert!(text.contains(&format!("[{}]", section)), "Abschnitt {} fehlt", section);
     }
+    assert!(!text.contains("[sounds]"), "Abschnitt [sounds] gehört nicht mehr in die Datei");
+    assert!(!text.contains("[ringtones]"), "Klingeltöne gehören nicht mehr in die Datei");
 
     assert!(text.ends_with('\n'), "Datei muss mit Zeilenumbruch enden");
 }
@@ -475,6 +459,9 @@ fn saving_does_not_trigger_any_action() {
                 Ok(_) => json!({ "ok": true }),
                 Err(_) => json!({ "ok": false }),
             }
+        }
+        fn sounds_dir(&self) -> PathBuf {
+            self.path.with_file_name("sounds")
         }
         fn run_action(&self, action: Command) {
             self.actions.lock().unwrap().push(action);

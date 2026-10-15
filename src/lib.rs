@@ -4,6 +4,7 @@
 //!
 //! - [`config`] holds the schema of the TOML configuration
 //! - [`command`] names the things the phone can be told to do
+//! - [`sounds`] holds the sound files the phone plays
 //! - [`sip`] wraps the `rvoip` SIP stack that replaced `linphonec`
 //! - [`webserver`] serves the status and configuration pages
 //! - [`phone`] is the state machine tying them together
@@ -18,6 +19,7 @@ pub mod gpio;
 pub mod pages;
 pub mod phone;
 pub mod sip;
+pub mod sounds;
 pub mod sync;
 pub mod webserver;
 

@@ -6,6 +6,7 @@
 //! leaves `mod.rs` about what the phone *does* rather than about how it is
 //! displayed.
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use serde_json::Value as Json_;
 use super::{modified, Phone};
 use crate::command::Command;
 use crate::config;
+use crate::sounds;
 use crate::sync::lock;
 use crate::webserver::PhoneApi;
 
@@ -43,9 +45,18 @@ impl PhoneApi for Arc<Phone> {
         let baseline = lock(&self.baseline);
         serde_json::json!({
             "sections": config::describe(&baseline),
+            // Die Klänge stehen nicht in der Datei, sondern sind hochgeladene
+            // Dateien. Sie gehören trotzdem hierher: die Seite baut daraus den
+            // ganzen Abschnitt, und ein zweiter Abruf nur für die Klänge wäre
+            // eine zweite Wahrheit, die nach dem Speichern auseinanderlaufen kann.
+            "sounds": sounds::describe(&self.options.sounds_dir),
             "mtime": *lock(&self.config_mtime),
             "restart_required": self.config_changed.load(Ordering::SeqCst),
         })
+    }
+
+    fn sounds_dir(&self) -> PathBuf {
+        self.options.sounds_dir.clone()
     }
 
     fn save_config(&self, payload: Json_) -> Json_ {

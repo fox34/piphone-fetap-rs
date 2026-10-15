@@ -43,9 +43,10 @@ A sample feature-complete configuration file is provided in `support/config-exam
 
 # Building
 
-- Never compile or test on macOS or Windows machines, except for End-to-End-Tests of the Webserver.
+- Only ever compile debug and tests on macOS or Windows, never the release.
 - Access to a Raspberry Pi Zero 2W with wired-up hardware can be provided for production testing.
-- Access to a Raspberry Pi 5 with 4GB of RAM can be provided for compiling.
+- Access to a Raspberry Pi 5 with 4GB of RAM can be provided for compiling the production version.
+- Avoid compiling debug binaries on the Raspberry Pi 5 for efficiency reasons.
 
 # Deployment
 
@@ -66,6 +67,7 @@ A sample feature-complete configuration file is provided in `support/config-exam
 | `src/gpio.rs` | Pulse decoding, watcher thread, LEDs with software PWM |
 | `src/gpio/linux.rs` | `gpiod` backend, the only hardware-touching module |
 | `src/config.rs` | Schema, validation, reading and writing the TOML file |
+| `src/sounds.rs` | The sound files the phone plays: fixed names, uploading, preview |
 | `src/command.rs` | The features and the names the dial and the web URL use for them |
 | `src/sync.rs` | `lock()`, the one place that says how poisoning is handled |
 | `src/webserver.rs` | axum routes, basic auth, actions |
@@ -127,7 +129,11 @@ An optional web server (`src/webserver.rs`) shows the phone status (uptime, conn
 call state) and the state of the features (night light, wake up mode, sleep music, dnd, next wake up time).
 It is configured in the `[web]` section of the TOML config file (port 0 = disabled) and can also be disabled
 with `--no-web`. The same actions as the rotary dial short codes can be triggered via
-`POST /api/action/<name>`, the state is available as JSON under `/api/state`.
+`POST /api/action/<name>`, the state is available as JSON under `/api/state`. The sound files are
+uploaded with `POST /api/sound/<name>` - the body is the file itself, not a multipart form - and
+`GET /api/sound/<name>` serves the same file for the preview in the browser. A file of a
+collection goes to `POST /api/sound/<collection>/<file name>`, is served from
+`GET /api/sound/<collection>/<file name>` and removed with `DELETE` on the same path.
 
 # Configuration
 
@@ -135,10 +141,55 @@ with `--no-web`. The same actions as the rotary dial short codes can be triggere
 option (type, default value, description, limits) and provides reading, validation and writing.
 `support/config-example.toml` is a documented sample.
 
-The config file can also be edited in the browser at `/config`, which covers every option. Numbers
-(dial codes and their targets in `[numbers]`) and ringtones are addable and removable tables. The
-schema is rendered dynamically into forms by the JS in `src/pages.rs`, so adding an option to
-`src/config.rs` makes it appear in the UI automatically.
+The config file can also be edited in the browser at `/config`, which covers every option. The
+dial codes and their targets in `[numbers]` are an addable and removable table. The schema is
+rendered dynamically into forms by the JS in `src/pages.rs`, so adding an option to
+`src/config.rs` makes it appear in the UI automatically. The sounds section of that page is the
+exception: it is built from the uploaded files, not from the schema.
+
+# Sounds
+
+The sounds the phone plays are not options: they are files in `/usr/local/share/piphone/sounds`
+(or wherever `--sounds` points), uploaded at `/config`. `src/sounds.rs` holds the one table that
+says which sounds there are and what they are called - the fixed ones as an enum with a `Spec` per
+variant, exactly like `src/command.rs` holds the features, so a name cannot be mistyped and point
+somewhere else.
+
+**Fixed sounds** (`boot`, `reboot`, `shutdown`, `ringtone`, `test_loud`, `test_earpiece`,
+`confirm`) have one file each under a fixed name: `boot` is `boot.wav` or `boot.mp3`.
+
+**Collections** are lists of uploaded files under `ringtones/` and `sleep/`. A track keeps the name
+it was uploaded under - that name is what tells two tracks apart. A ringtone does not: the page
+asks for the number next to the file field, it is required, and the server derives the whole name
+from it (`ringtone_name`), so neither a browser nor a script can choose one:
+
+- `ringtones/ringtone-<Rufnummer>.wav` is the ringtone of that one caller. Only that exact
+  `ringtone-` prefix followed by digits counts; anything else in `ringtones/` is not played and
+  not listed (`Pool::counted`), and it stays where it is rather than being cleaned up. A name like
+  `ring-01` binds a file to nothing, or it would belong to the number `01`.
+- A caller without a file of their own gets the fixed `ringtone`, and a phone that has neither is
+  silent rather than guessing.
+- Everything in `sleep/` is one playlist, shuffled anew on every start and played for at least
+  15 minutes (a single file is played once).
+
+Both formats are the same everywhere:
+
+- The extension follows the upload, not the other way round: the format is recognised from the
+  first bytes, so a file is `ringtone-01.wav` or `ringtone-01.mp3` and the preview is served with the
+  content type the bytes actually have. Playback does not depend on it - symphonia probes the
+  content - but a MP3 announced as `audio/wav` does not play in a browser.
+- An upload that is neither WAV nor MP3 is refused, and written through a temporary file like the
+  config: an upload that fails halfway leaves the old file, not half a new one. Replacing a file
+  also removes the file of the other extension, because only one of the two can be the sound.
+- A name from the browser or a script is trimmed down to what can be a file name in that directory
+  (`file_stem`); a name that would escape it is refused, not repaired. Only files whose name ends
+  in `.wav` or `.mp3` belong to a collection, and nothing is deleted that the phone did not write:
+  a file put there by hand should stay, whether it is listed or not.
+- Missing fixed sounds are listed at startup and silent afterwards: playback of an empty path is
+  what the audio channel has always done, and a sound that is not there is not an error at that
+  moment.
+- `[sounds]` and `[ringtones]` are both gone from the configuration. A file that still has them
+  gets them named as unknown at startup and loses them on the next save.
 
 A list option puts every entry on its own line of a textarea, unless `item_fields` gives each entry a
 labelled input of its own - which is what the wake-up times use: seven weekday pickers, because a

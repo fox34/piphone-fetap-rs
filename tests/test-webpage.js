@@ -39,6 +39,29 @@ function check(label, condition, detail = '') {
 const html = rendered('CONFIG_PAGE');
 const configPayload = JSON.parse(rendered('fixture'));
 
+// Die Fixture kommt aus einem Verzeichnis, in dem es die Klänge nicht gibt -
+// die Seite muss auch genau diesen Zustand darstellen können. Für den Test mit
+// hochgeladenen Klängen wird jeder feste Klang als vorhanden gemeldet, bis auf
+// `boot`, damit beide Zustände im selben Lauf vorkommen; die beiden Listen sind
+// mit Dateien gefüllt, weil eine leere Liste nichts zu zeigen hat außer dem
+// Hinweis, dass noch nichts da ist.
+const uploaded = key => key !== 'boot';
+configPayload.sounds.fixed = configPayload.sounds.fixed.map(sound => uploaded(sound.key)
+  ? {...sound, present: true, file: `${sound.key}.wav`, size: 2048, content_type: 'audio/wav'}
+  : sound);
+
+const collection = {
+  ringtones: [
+    {name: 'Ring-01.wav', size: 2048, content_type: 'audio/wav', caller: null},
+    {name: 'ringtone-08912345.mp3', size: 4096, content_type: 'audio/mpeg', caller: '08912345'},
+  ],
+  sleep: [
+    {name: 'Brahms_Lullaby.mp3', size: 8388608, content_type: 'audio/mpeg', caller: null},
+  ],
+};
+configPayload.sounds.pools = configPayload.sounds.pools.map(
+  pool => ({...pool, files: collection[pool.key] || []}));
+
 const dom = new JSDOM(html, {runScripts: 'outside-only', url: 'http://localhost/config'});
 const {window} = dom;
 
@@ -65,7 +88,7 @@ setTimeout(async () => {
   console.log('Formular aufbauen');
   const sections = [...doc.querySelectorAll('[data-section]')].map(s => s.dataset.section);
   check('alle Abschnitte gerendert',
-    JSON.stringify(sections) === JSON.stringify(['network', 'sip', 'pins', 'numbers', 'ringtones', 'sounds', 'misc', 'web']),
+    JSON.stringify(sections) === JSON.stringify(['network', 'sip', 'pins', 'numbers', 'misc', 'web']),
     JSON.stringify(sections));
   check('Speichern erst nach dem Laden aktiv', doc.getElementById('save').disabled === false);
   check('unveränderte Konfiguration zeigt keinen Hinweis', doc.querySelector('#message').children.length === 0,
@@ -110,10 +133,11 @@ setTimeout(async () => {
         wakePickers.map(i => i.value).join(','));
   check('kein Textfeld mehr für die Aufstehzeiten',
         doc.querySelector(`${wakeField} textarea`) === null);
-  check('Einschlafmusik als Zeilen',
-    doc.querySelector('[data-section="sounds"] [data-field="sleep_music"] textarea').value.includes('.mp3'));
+  check('keine Pfadeingabe mehr für die Klänge',
+    doc.querySelector('[data-field="sleep_music"]') === null &&
+    doc.querySelector('[data-section="sounds"]') === null);
 
-  console.log('Kurzwahlen und Klingeltöne');
+  console.log('Kurzwahlen');
   const rows = selector => doc.querySelectorAll(`[data-section="${selector}"] [data-row]`);
   const inputs = row => [...row.querySelectorAll('input')].map(i => i.value);
   const numbers = [...rows('numbers')].map(inputs);
@@ -121,9 +145,180 @@ setTimeout(async () => {
   check('erste Kurzwahl gefüllt', numbers[0][0] === '01' && numbers[0][1] === '01234567');
   check('Kurzbefehl als Ziel',
     numbers.some(n => n[1] === 'enable-night-mode') && numbers.some(n => n[1] === 'shutdown'));
-  check('Klingeltöne als Zeilen', rows('ringtones').length === 1);
+  check('kein eigener Abschnitt für die Klingeltöne',
+    doc.querySelector('[data-section="ringtones"]') === null);
   check('Vorschläge für Kurzbefehle vorhanden',
     doc.querySelectorAll('[data-section="numbers"] datalist option').length === 6);
+
+  console.log('Klänge');
+  const order = [...doc.querySelectorAll('#form > section')]
+    .map(section => section.classList.contains('sounds') ? 'sounds' : section.dataset.section);
+  check('Klänge stehen vor dem Nachtlicht',
+    JSON.stringify(order) ===
+      JSON.stringify(['network', 'sip', 'pins', 'numbers', 'sounds', 'misc', 'web']),
+    JSON.stringify(order));
+
+  const sound = key => doc.querySelector(`[data-sound="${key}"]`);
+  check('jeder Klang hat eine Zeile',
+    doc.querySelectorAll('[data-sound]').length === configPayload.sounds.fixed.length);
+  check('hochgeladener Klang zeigt seinen Dateinamen',
+    sound('ringtone').querySelector('.sound-file').textContent === 'ringtone.wav (2 kB)',
+    sound('ringtone').querySelector('.sound-file').textContent);
+  check('hochgeladener Klang lässt sich anhören',
+    sound('ringtone').querySelector('.sound-preview').hidden === false);
+  check('Klang ohne Datei hat keine Vorschau',
+    sound('boot').querySelector('.sound-preview').hidden === true);
+  check('Klang ohne Datei lädt hoch statt zu ersetzen',
+    sound('boot').querySelector('label.upload span').textContent === 'Hochladen' &&
+    sound('ringtone').querySelector('label.upload span').textContent === 'Ersetzen');
+  check('jede Zeile hat eine Dateiauswahl',
+    [...doc.querySelectorAll('[data-sound]')].every(row => row.querySelector('input[type=file]')));
+
+  console.log('Klingeltöne und Einschlafmusik');
+  const pool = key => doc.querySelector(`[data-pool="${key}"]`);
+  const poolOrder = [...doc.querySelectorAll('[data-pool]')].map(node => node.dataset.pool);
+  check('beide Listen stehen unter den Klängen',
+    JSON.stringify(poolOrder) === JSON.stringify(['ringtones', 'sleep']), JSON.stringify(poolOrder));
+  check('jede Liste zeigt ihren Namen',
+    [...doc.querySelectorAll('[data-pool]')].every(node => {
+      const known = configPayload.sounds.pools.find(p => p.key === node.dataset.pool);
+      return node.previousElementSibling && node.previousElementSibling.textContent === known.label;
+    }),
+    configPayload.sounds.pools.map(p => p.label).join(','));
+  check('Klingeltöne als Dateien',
+    pool('ringtones').querySelectorAll('[data-file]').length === 2);
+  check('Klingelton mit Rufnummer im Namen zeigt die Nummer',
+    pool('ringtones').querySelector('[data-file="ringtone-08912345.mp3"] .caller')
+      .textContent.includes('08912345'),
+    pool('ringtones').querySelector('[data-file="ringtone-08912345.mp3"]').textContent);
+  check('Klingelton ohne Rufnummer wird keiner zugeordnet',
+    pool('ringtones').querySelector('[data-file="Ring-01.wav"] .caller') === null);
+  check('Einschlafmusik als Dateien',
+    pool('sleep').querySelectorAll('[data-file]').length === 1);
+  check('jede Datei hat Vorschau, Löschen und eine Dateiauswahl für die Liste',
+    [...doc.querySelectorAll('[data-pool] [data-file]')].every(row =>
+      row.querySelector('button') && row.querySelector('button.danger')) &&
+    [...doc.querySelectorAll('[data-pool]')].every(node => node.querySelector('input[type=file]')));
+
+  // Vorschau: der Klang kommt als Datei vom Server, nicht aus der Konfiguration.
+  const played = [];
+  window.Audio = class {
+    constructor(src) { this.src = src; }
+    play() { played.push(this.src); return Promise.resolve(); }
+    pause() {}
+    addEventListener() {}
+  };
+  const previewOf = row => row.querySelector('button:not(.danger)');
+  previewOf(sound('ringtone')).click();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  check('Vorschau lädt die Klangdatei',
+    played.length === 1 && played[0] === '/api/sound/ringtone', JSON.stringify(played));
+  check('Schaltfläche wird zum Stopp',
+    sound('ringtone').querySelector('.sound-preview').textContent === 'Stopp');
+  previewOf(sound('ringtone')).click();
+  check('Schaltfläche wird wieder zur Vorschau',
+    sound('ringtone').querySelector('.sound-preview').textContent === 'Vorschau');
+
+  previewOf(pool('ringtones').querySelector('[data-file="Ring-01.wav"]')).click();
+  await new Promise(resolve => setTimeout(resolve, 10));
+  check('Vorschau einer hochgeladenen Datei lädt ihren Namen',
+    played.length === 2 && played[1] === '/api/sound/ringtones/Ring-01.wav', JSON.stringify(played));
+  previewOf(pool('ringtones').querySelector('[data-file="Ring-01.wav"]')).click();
+
+  // Hochladen: die Datei ist der Rumpf der Anfrage, und bei den Listen steckt
+  // der Name, den die Datei behalten soll, in der Adresse.
+  const choose = (input, file) => {
+    Object.defineProperty(input, 'files', {value: [file], configurable: true});
+    input.dispatchEvent(new window.Event('change'));
+  };
+  const soundFile = (name, size = 44) =>
+    new window.File([new Uint8Array(size)], name, {type: 'audio/wav'});
+
+  const uploads = [];
+  window.fetch = async (url, options) => {
+    if (url.startsWith('/api/sound/')) {
+      uploads.push({url, options});
+      const sound = configPayload.sounds.fixed.find(s => s.key === 'boot');
+      return {status: 200, json: async () => ({
+        ok: true,
+        sound: {...sound, present: true, file: 'boot.wav', size: 44, content_type: 'audio/wav'},
+      })};
+    }
+    return {json: async () => JSON.parse(JSON.stringify(configPayload))};
+  };
+  choose(sound('boot').querySelector('input[type=file]'), soundFile('start.wav'));
+  await new Promise(resolve => setTimeout(resolve, 50));
+  check('Upload an /api/sound/boot gesendet',
+    uploads.length === 1 && uploads[0].url === '/api/sound/boot', JSON.stringify(uploads.map(u => u.url)));
+  check('Datei ist der Rumpf des Uploads',
+    uploads.length === 1 && uploads[0].options.method === 'POST' && uploads[0].options.body.name === 'start.wav');
+  check('Zeile nach dem Upload aktualisiert',
+    sound('boot').querySelector('.sound-file').textContent === 'boot.wav (44 B)',
+    sound('boot').querySelector('.sound-file').textContent);
+  check('Vorschau erscheint nach dem Upload',
+    sound('boot').querySelector('.sound-preview').hidden === false);
+
+  // Ein abgelehnter Upload sagt, woran es lag, und lässt den alten Klang stehen.
+  window.fetch = async () => ({status: 400, json: async () => ({
+    ok: false, error: 'Datei ist weder WAV noch MP3. Es werden nur diese beiden Formate abgespielt.',
+  })});
+  choose(sound('ringtone').querySelector('input[type=file]'), soundFile('kaputt.txt', 3));
+  await new Promise(resolve => setTimeout(resolve, 50));
+  check('Fehler des Uploads steht an der Zeile',
+    sound('ringtone').querySelector('.status').className.includes('err') &&
+    sound('ringtone').querySelector('.status').textContent.includes('WAV'),
+    sound('ringtone').querySelector('.status').textContent);
+  check('alter Klang nach fehlgeschlagenem Upload erhalten',
+    sound('ringtone').querySelector('.sound-file').textContent.includes('ringtone.wav'));
+
+  // Hochladen in eine Liste: der Name der Datei ist Teil der Adresse.
+  const added = [];
+  window.fetch = async (url, options) => {
+    if (url.startsWith('/api/sound/sleep/')) {
+      added.push({url, options});
+      return {status: 200, json: async () => ({
+        ok: true,
+        file: {name: 'Gute-Nacht.mp3', size: 4096, content_type: 'audio/mpeg', caller: null},
+      })};
+    }
+    return {json: async () => JSON.parse(JSON.stringify(configPayload))};
+  };
+  choose(pool('sleep').querySelector('input[type=file]'), soundFile('Gute Nacht.mp3', 4096));
+  await new Promise(resolve => setTimeout(resolve, 50));
+  check('Upload in die Liste trägt den Dateinamen',
+    added.length === 1 && added[0].url === '/api/sound/sleep/Gute%20Nacht.mp3',
+    JSON.stringify(added.map(a => a.url)));
+  check('hochgeladener Titel steht in der Liste',
+    pool('sleep').querySelectorAll('[data-file]').length === 2 &&
+    pool('sleep').querySelector('[data-file="Gute-Nacht.mp3"]') !== null,
+    [...pool('sleep').querySelectorAll('[data-file]')].map(n => n.dataset.file).join(','));
+  check('Name, unter dem die Datei liegt, wird genannt',
+    pool('sleep').querySelector('[data-status]').textContent.includes('Gute-Nacht.mp3'),
+    pool('sleep').querySelector('[data-status]').textContent);
+
+  // Löschen: die Datei verschwindet aus der Liste.
+  const deleted = [];
+  window.fetch = async (url, options) => {
+    deleted.push({url, options});
+    return {status: 200, json: async () => ({ok: true})};
+  };
+  pool('ringtones').querySelector('[data-file="Ring-01.wav"] button.danger').click();
+  await new Promise(resolve => setTimeout(resolve, 50));
+  check('Löschen fragt nach dem genauen Dateinamen',
+    deleted.length === 1 && deleted[0].options.method === 'DELETE' &&
+    deleted[0].url === '/api/sound/ringtones/Ring-01.wav',
+    JSON.stringify(deleted.map(d => [d.url, d.options.method])));
+  check('gelöschte Datei steht nicht mehr in der Liste',
+    pool('ringtones').querySelectorAll('[data-file]').length === 1 &&
+    pool('ringtones').querySelector('[data-file="Ring-01.wav"]') === null,
+    [...pool('ringtones').querySelectorAll('[data-file]')].map(n => n.dataset.file).join(','));
+  check('Upload löst keinen Neustart aus',
+    requests.filter(r => r.url && r.url.includes('/api/action/')).length === 0);
+
+  window.fetch = async (url, options) => {
+    requests.push({url, options});
+    return {json: async () => JSON.parse(JSON.stringify(configPayload))};
+  };
 
   console.log('Nummern hinzufügen und entfernen');
   const addNumber = [...doc.querySelectorAll('[data-section="numbers"] button')]
@@ -172,11 +367,11 @@ setTimeout(async () => {
   check('Aufstehzeiten in Wochentagsreihenfolge gesendet',
     sent.misc.wake_up_times.join(',') === '05:00,05:00,05:00,05:00,05:00,06:00,06:00',
     JSON.stringify(sent.misc.wake_up_times));
-  check('Einschlafmusik als Array', Array.isArray(sent.sounds.sleep_music));
+  check('keine Klänge in der Konfiguration gesendet', !('sounds' in sent), Object.keys(sent).join(','));
+  check('keine Klingeltöne in der Konfiguration gesendet', !('ringtones' in sent), Object.keys(sent).join(','));
   check('Kurzwahlen als Objekte', sent.numbers['01'] === '01234567');
   check('Kurzbefehl mitgesendet', sent.numbers['11'] === 'enable-night-mode');
   check('leere Zeile nicht mitgesendet', !('' in sent.numbers) && !Object.values(sent.numbers).includes(''));
-  check('Klingeltöne mitgesendet', sent.ringtones['08912345'] === '/usr/local/share/piphone/sounds/ring-02.wav');
   check('Pflichtfelder mitgesendet', sent.pins.nsi === '23' && sent.pins.gabel === '15');
 
   console.log('Fehleranzeige');

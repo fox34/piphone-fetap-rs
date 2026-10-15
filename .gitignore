@@ -1,7 +1,8 @@
 .DS_Store
 /.ssh
-/target
 /node_modules
+/support/sounds/sleep/*
+/target
 package-lock.json
 AGENTS.override.md
 

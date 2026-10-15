@@ -51,27 +51,6 @@ gabel = 15
 "02" = "02345678"
 "03" = "03456789"
 
-[ringtones]
-# Rufnummerspezifische Klingeltöne
-"08912345" = "/usr/local/share/piphone/sounds/ring-02.wav"
-
-[sounds]
-boot = "/usr/local/share/piphone/sounds/boot-loud.wav"
-reboot = "/usr/local/share/piphone/sounds/reboot-loud.wav"
-shutdown = "/usr/local/share/piphone/sounds/shutdown-loud.wav"
-
-# Generischer Klingelton
-ring = "/usr/local/share/piphone/sounds/ring-01.wav"
-
-test_earpiece = "/usr/local/share/piphone/sounds/test-earpiece.wav"
-test_loud = "/usr/local/share/piphone/sounds/test-loud.wav"
-
-
-action_confirmed = "/usr/local/share/piphone/sounds/confirm.wav"
-
-# Einschlafmusik: mehrere Dateien werden in zufälliger Reihenfolge abgespielt.
-# Beispieldatei aus urheberrechtlichen Gründen nicht in Repository
-sleep_music = ["/usr/local/share/piphone/sounds/sleep-Brahms_Lullaby.mp3"]
 
 # Nachtmodus / Aufwachlicht
 [misc]

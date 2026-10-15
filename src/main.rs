@@ -16,6 +16,7 @@ Aufruf:
 
 Optionen:
   -c, --config <DATEI>   Pfad zur Konfigurationsdatei (Standard: /usr/local/etc/piphone/config.toml)
+      --sounds <ORDNER>  Verzeichnis der Klangdateien (Standard: /usr/local/share/piphone/sounds)
       --ignore-dnd       Nicht stören für Testzwecke deaktivieren
       --no-web           Webserver zur Steuerung nicht starten
       --silent-boot      Keinen Start-Sound abspielen
@@ -57,6 +58,10 @@ fn parse_args() -> Result<Option<Options>, String> {
             "-c" | "--config" => {
                 let value = args.next().ok_or("Option --config braucht einen Pfad.")?;
                 options.config = PathBuf::from(value);
+            }
+            "--sounds" => {
+                let value = args.next().ok_or("Option --sounds braucht einen Pfad.")?;
+                options.sounds_dir = PathBuf::from(value);
             }
             "--ignore-dnd" => options.ignore_dnd = true,
             "--no-web" => options.no_web = true,

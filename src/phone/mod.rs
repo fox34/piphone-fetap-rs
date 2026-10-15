@@ -29,6 +29,7 @@ use crate::command::Command;
 use crate::config::{self, Table};
 use crate::gpio::{Gpio, Led, Watcher};
 use crate::sip::{CallDecision, SipClient, SipEvent};
+use crate::sounds::{self, Sound};
 use crate::sync::lock;
 
 /// ALSA device holding the earpiece and microphone. See
@@ -42,6 +43,10 @@ const MAX_DIAL_CODE: usize = config::MAX_DIAL_CODE;
 #[derive(Debug, Clone)]
 pub struct Options {
     pub config: PathBuf,
+    /// Where the sound files are. Fixed in production, a directory of its own
+    /// in a test - the sounds are not configured, so this is the only thing
+    /// that says where they are.
+    pub sounds_dir: PathBuf,
     pub ignore_dnd: bool,
     pub no_web: bool,
     pub silent_boot: bool,
@@ -52,6 +57,7 @@ impl Default for Options {
     fn default() -> Self {
         Options {
             config: PathBuf::from("/usr/local/etc/piphone/config.toml"),
+            sounds_dir: PathBuf::from(sounds::DIR),
             ignore_dnd: false,
             no_web: false,
             silent_boot: false,
@@ -234,6 +240,21 @@ impl Phone {
             }
         }
 
+        // Klänge ohne Datei fallen zur Laufzeit nur dann auf, wenn gerade der
+        // Moment kommt, in dem sie laufen sollen - und das ist selten genug,
+        // um es zu übersehen. Also gleich beim Start sagen, welche fehlen.
+        let missing = sounds::Spec::missing(&options.sounds_dir);
+        if !missing.is_empty() {
+            println!(
+                "In {} fehlen {} Klänge, die über /config hochgeladen werden können:",
+                options.sounds_dir.display(),
+                missing.len()
+            );
+            for spec in missing {
+                println!(" - {} ({})", spec.label, spec.stem);
+            }
+        }
+
         let config_mtime = modified(&options.config).unwrap_or(0.0);
 
         let gpio = Gpio::new()?;
@@ -339,9 +360,9 @@ impl Phone {
         self.hungup.load(Ordering::SeqCst)
     }
 
-    /// A sound path from the configuration.
-    fn sound(&self, key: &str) -> String {
-        config::option_str(&self.config, "sounds", key)
+    /// A sound path, empty when the file has not been uploaded yet.
+    fn sound(&self, sound: Sound) -> String {
+        sound.path(&self.options.sounds_dir)
     }
 
     /// Numbers the rotary dial may call or which may call us.
@@ -367,14 +388,15 @@ impl Phone {
             .map(|v| v.to_display_string())
     }
 
-    /// Ringtone configured for a caller, falling back to the generic one.
+    /// The ringtone for a caller, empty when there is no file to play.
+    ///
+    /// Which file rings for which number says the name of the file: a caller is
+    /// not looked up in the configuration any more, because there is nothing
+    /// left in it that could be looked up.
     fn ringtone_for(&self, caller: &str) -> String {
-        self.config
-            .get("ringtones")
-            .and_then(|v| v.as_table())
-            .and_then(|table| table.get(caller))
-            .map(|v| v.to_display_string())
-            .unwrap_or_else(|| self.sound("ring"))
+        sounds::ringtone_for(&self.options.sounds_dir, caller)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 
     // ---------------------------------------------------------------- rotary dial
@@ -448,7 +470,7 @@ impl Phone {
             Command::NightMode => {
                 self.start_night_mode();
                 self.background(|phone| {
-                    phone.audio.play_speaker(&phone.sound("action_confirmed")).wait()
+                    phone.audio.play_speaker(&phone.sound(Sound::Confirm)).wait()
                 });
             }
             Command::SleepMusic => self.toggle_sleep_music(),
@@ -609,7 +631,7 @@ impl Phone {
     fn on_sip_ready(&self) {
         if self.first_boot.swap(false, Ordering::SeqCst) {
             if !self.options.silent_boot {
-                self.audio.play_speaker(&self.sound("boot"));
+                self.audio.play_speaker(&self.sound(Sound::Boot));
             }
             self.led.wake_light_off();
         }
@@ -841,9 +863,13 @@ impl Phone {
 
     /// Play the sleep music; runs on a blocking thread because it waits for playback.
     fn play_sleep_music(self: &Arc<Self>) {
-        let tracks = config::option_list(&self.config, "sounds", "sleep_music");
+        let mut tracks: Vec<String> = sounds::sleep_music(&self.options.sounds_dir)
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+
         if tracks.is_empty() {
-            println!("Kann Einschlafmusik nicht starten: keine Datei angegeben!");
+            println!("Kann Einschlafmusik nicht starten: keine Datei hochgeladen!");
             self.sleep_music_running.store(false, Ordering::SeqCst);
             return;
         }
@@ -854,12 +880,13 @@ impl Phone {
             println!("Spiele Einschlafmusik.");
             self.audio.play_speaker(&tracks[0]).wait();
         } else {
-            // Several tracks: play in random order for at least 15 minutes.
-            let mut order = tracks.clone();
-            order.shuffle(&mut rand::rng());
+            // Several tracks: play in random order for at least 15 minutes. The
+            // order is drawn anew every time, so nobody hears the same sequence
+            // on two nights running.
+            tracks.shuffle(&mut rand::rng());
             let start = Instant::now();
 
-            for track in order {
+            for track in tracks {
                 if self.stop_sleep_music.load(Ordering::SeqCst) {
                     if self.options.verbose {
                         println!("Einschlafmusik auf Anforderung gestoppt.");
@@ -887,7 +914,14 @@ impl Phone {
         }
 
         if self.options.verbose {
-            println!("Einschlafmusik beendet.");
+            // The flag says whether the music ended or somebody stopped it,
+            // which is the difference between a phone that went quiet on its own
+            // and one that did not.
+            if self.stop_sleep_music.load(Ordering::SeqCst) {
+                println!("Einschlafmusik auf Anforderung gestoppt.");
+            } else {
+                println!("Einschlafmusik beendet.");
+            }
         }
 
         // Do not disturb was only meant for the music.
@@ -901,7 +935,7 @@ impl Phone {
 
     /// Play a test tone on the loudspeaker.
     pub fn test_loudspeaker(&self) {
-        self.audio.play_speaker(&self.sound("test_loud")).wait();
+        self.audio.play_speaker(&self.sound(Sound::TestLoud)).wait();
     }
 
     /// Play a test tone in the earpiece.
@@ -909,20 +943,20 @@ impl Phone {
         self.audio.stop_speaker();
         // A short pause so the tone is not masked by whatever was still playing.
         std::thread::sleep(Duration::from_millis(500));
-        self.audio.play_earpiece(&self.sound("test_earpiece")).wait();
+        self.audio.play_earpiece(&self.sound(Sound::TestEarpiece)).wait();
     }
 
     /// Reboot the phone after playing a tone.
     pub fn reboot(&self) {
         println!("Starte System neu.");
-        self.audio.play_speaker(&self.sound("reboot")).wait();
+        self.audio.play_speaker(&self.sound(Sound::Reboot)).wait();
         let _ = std::process::Command::new("systemctl").args(["reboot", "-i"]).status();
     }
 
     /// Power the phone down after playing a tone.
     pub fn shutdown(&self) {
         println!("Fahre System herunter.");
-        self.audio.play_speaker(&self.sound("shutdown")).wait();
+        self.audio.play_speaker(&self.sound(Sound::Shutdown)).wait();
         let _ = std::process::Command::new("systemctl").args(["poweroff", "-i"]).status();
     }
 

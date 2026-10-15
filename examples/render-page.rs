@@ -5,11 +5,16 @@
 //!
 //!     cargo run --example render-page -- CONFIG_PAGE
 //!     cargo run --example render-page -- fixture
+//!
+//! The sounds in the fixture come from a directory that does not exist on a
+//! development machine, so they all read as "no file uploaded" - which is what
+//! the page has to render anyway. The test patches in the uploaded state.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use piphone::config;
 use piphone::pages::{CONFIG_PAGE, PAGE};
+use piphone::sounds;
 
 fn main() {
     let Some(what) = std::env::args().nth(1) else {
@@ -37,9 +42,18 @@ fn print_fixture() {
 
     let payload = serde_json::json!({
         "sections": config::describe(&data),
+        "sounds": sounds::describe(&absent_sounds()),
         "mtime": 1_700_000_000.0,
         "restart_required": false,
     });
 
     println!("{}", serde_json::to_string_pretty(&payload).expect("JSON schreiben"));
+}
+
+/// A sounds directory that is not there, so every sound reads as absent.
+///
+/// That is the state of a phone that has never been set up, and the one the
+/// page has to be able to render.
+fn absent_sounds() -> PathBuf {
+    Path::new("/nonexistent/piphone/sounds").to_path_buf()
 }

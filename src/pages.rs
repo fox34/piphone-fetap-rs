@@ -156,7 +156,7 @@ pub const CONFIG_PAGE: &str = r##"<!DOCTYPE html>
   label { display: block; font-size: .9rem; margin-bottom: .2rem; }
   label small { color: #666; font-weight: normal; }
   .caption { display: block; font-size: .9rem; margin-bottom: .2rem; }
-  input[type=text], input[type=number], input[type=password], input[type=time], select, textarea {
+  input[type=text], input[type=number], input[type=password], input[type=time], input[type="tel"], select, textarea {
     width: 100%; box-sizing: border-box; padding: .5rem;
     background: #1c1c1c; color: #eee; border: 1px solid #333; border-radius: .3rem;
     font: inherit;
@@ -197,6 +197,25 @@ pub const CONFIG_PAGE: &str = r##"<!DOCTYPE html>
   .banner.err { background: #2a1616; border: 1px solid #6b3d3d; color: #e8a5a5; }
   .banner ul { margin: .4rem 0 0; padding-left: 1.1rem; }
   .spinner { color: #777; font-size: .85rem; }
+  .sound-row { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+  .sound-file { color: #999; font-size: .85rem; flex: 1; min-width: 7rem; }
+  .sound-file .caller { color: #6a8fa8; margin-left: .5rem; }
+  .pool { margin-bottom: 1rem; }
+  .pool h3 { font-size: .9rem; font-weight: 600; color: #bbb; margin: 1.2rem 0 .3rem; }
+  .pool-files { display: flex; flex-direction: column; gap: .35rem; margin: .4rem 0; }
+  .pool-files .sound-row { padding: .1rem 0; }
+  label.upload {
+    display: inline-flex; align-items: center; padding: .5rem .6rem; font-size: .85rem;
+    border: 1px solid #333; border-radius: .4rem; background: #1c1c1c; color: #ddd;
+    cursor: pointer;
+  }
+  label.upload:hover { background: #262626; }
+  label.upload input { display: none; }
+  .pool-upload { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+  .pool-upload input { flex: 1; min-width: 8rem; width: auto; }
+  .status { color: #7ddc7d; font-size: .8rem; min-height: 1.2em; }
+  .status.err { color: #e88; }
+  .status.busy { color: #777; }
 </style>
 </head>
 <body>
@@ -468,6 +487,294 @@ function renderSection(section) {
   return node;
 }
 
+// ---------------------------------------------------------------- Klänge
+
+// Die Klänge stehen nicht in der Konfiguration, sondern sind hochgeladene
+// Dateien, und der Server schickt zu jeder den Zustand, den die Seite anzeigt:
+// feste Klänge mit dem Klarnamen, unter dem sie liegen, und zwei Listen
+// hochgeladener Dateien, die ihren Namen behalten.
+//
+// Der Rumpf der Anfrage ist jeweils die Datei selbst - an /api/sound/<name> für
+// einen festen Klang, an /api/sound/<sammlung>/<dateiname> für eine Datei in
+// einer Liste.
+
+const soundUrl = key => `/api/sound/${encodeURIComponent(key)}`;
+const poolUrl = (pool, name) => `/api/sound/${encodeURIComponent(pool)}/${encodeURIComponent(name)}`;
+
+// Die Endung, unter der eine Auswahl hochgeladen wird. Welches Format sie
+// wirklich hat, entscheidet der Server am Inhalt; hier steht nur, was der
+// Browser für eine Endung hält.
+const extensionOf = file => {
+  const match = /\.([a-z0-9]{1,5})$/i.exec(file.name || '');
+  return match ? match[1] : 'wav';
+};
+
+const formatSize = bytes => bytes < 1024 ? `${bytes} B`
+  : bytes < 1024 * 1024 ? `${Math.round(bytes / 1024)} kB`
+  : `${(bytes / 1048576).toFixed(1).replace('.', ',')} MB`;
+
+// Was gerade läuft, damit ein zweiter Klang den ersten beendet.
+let preview = null;
+
+function say(status, text, kind = 'busy') {
+  status.textContent = text;
+  status.className = `status ${kind}`;
+}
+
+// Die Antwort des Servers lesen. Sie ist JSON - außer der Request war zu groß,
+// dann kommt der Text der Fehlerseite und `json()` scheitert.
+async function answer(response) {
+  return response.json().catch(
+    () => ({ok: false, error: `Die Anfrage ist fehlgeschlagen (${response.status})`}));
+}
+
+// Ein Klang anhören; derselbe Klang noch einmal anklicken hält ihn an.
+function togglePreview(url, button, status) {
+  if (preview && preview.url === url) {
+    stopPreview();
+    return;
+  }
+  stopPreview();
+
+  const audio = new Audio(url);
+  // Der Klang läuft genau einmal; danach ist die Schaltfläche wieder "Vorschau".
+  audio.addEventListener('ended', stopPreview);
+  audio.addEventListener('error', () => say(status, 'Klang nicht abspielbar.', 'err'));
+
+  preview = {url, audio, button};
+  button.textContent = 'Stopp';
+
+  audio.play().catch(e => {
+    console.error(e);
+    stopPreview();
+    say(status, 'Klang nicht abspielbar.', 'err');
+  });
+}
+
+function stopPreview() {
+  if (!preview) return;
+  preview.audio.pause();
+  preview.button.textContent = 'Vorschau';
+  preview = null;
+}
+
+// Ein Auswahlfeld für eine Audiodatei, als Beschriftung über einem Knopf.
+function uploadButton(text, onFile) {
+  return el('label', {class: 'upload'}, [
+    el('span', {text}),
+    el('input', {
+      type: 'file', accept: 'audio/wav,audio/mpeg,audio/*',
+      onchange: event => {
+        const file = event.target.files[0];
+        // Zurückgesetzt, damit dieselbe Datei noch einmal gewählt werden kann -
+        // sonst ändert der Browser nichts und es passiert nichts.
+        event.target.value = '';
+        if (file) onFile(file);
+      },
+    }),
+  ]);
+}
+
+// ---------------------------------------------------------------- feste Klänge
+
+// Zustand einer Zeile: Dateiname und Größe, Vorschau nur wenn es etwas zu
+// hören gibt. Die Angaben kommen vom Server, nicht aus dem Dateinamen der
+// Auswahl - der kann heißen wie er will.
+function paintSound(row, sound) {
+  row.querySelector('.sound-file').textContent = sound.present
+    ? `${sound.file} (${formatSize(sound.size)})`
+    : 'keine Datei';
+  row.querySelector('.sound-preview').hidden = !sound.present;
+  row.querySelector('label.upload span').textContent = sound.present ? 'Ersetzen' : 'Hochladen';
+}
+
+function soundRow(sound) {
+  const status = el('div', {class: 'status'});
+
+  const previewButton = el('button', {
+    type: 'button', class: 'small sound-preview', text: 'Vorschau',
+    onclick: () => togglePreview(soundUrl(sound.key), previewButton, status),
+  });
+
+  const row = el('div', {class: 'field', 'data-sound': sound.key}, [
+    el('span', {class: 'caption', text: sound.label}),
+    el('p', {class: 'hint'}, (sound.help || []).map(h => el('div', {text: h}))),
+    el('div', {class: 'sound-row'}, [
+      el('span', {class: 'sound-file'}),
+      previewButton,
+      uploadButton(sound.present ? 'Ersetzen' : 'Hochladen',
+        file => uploadSound(sound.key, file, row)),
+    ]),
+    status,
+  ]);
+
+  paintSound(row, sound);
+  return row;
+}
+
+// Nur diese eine Zeile wird neu aufgebaut, damit die übrigen Eingaben des
+// Formulars unangetastet bleiben - ein Neuaufbau des ganzen Formulars würde sie
+// verwerfen.
+async function uploadSound(key, file, row) {
+  const status = row.querySelector('.status');
+  say(status, `${file.name || 'Datei'} wird hochgeladen …`);
+
+  try {
+    const result = await answer(await fetch(soundUrl(key), {method: 'POST', body: file}));
+    if (!result.ok) throw new Error(result.error || 'Hochladen fehlgeschlagen');
+
+    if (preview && preview.url === soundUrl(key)) stopPreview();
+    paintSound(row, result.sound);
+    say(status, `${result.sound.file} gespeichert.`);
+  } catch (e) {
+    console.error(e);
+    say(status, e.message, 'err');
+  }
+}
+
+// ---------------------------------------------------------------- Listen
+
+// Eine Liste hochgeladener Dateien: Klingeltöne oder Einschlafmusik. Bei den
+// Klingeltönen entscheidet die Rufnummer über den Namen der Datei, also steht sie
+// im Feld daneben und ist Pflicht: ohne sie hätte die Datei keinen Namen, unter
+// dem das Telefon sie wiederfindet. Bei der Einschlafmusik behält die Datei den
+// Namen, den sie hat.
+function poolSection(pool) {
+  const list = el('div', {class: 'pool-files'});
+  const status = el('div', {class: 'status', 'data-status': ''});
+
+  // Die Dateien aus der Antwort werden hier weitergeführt: nach einem Upload
+  // oder einem Löschen wird nur dieser Abschnitt neu aufgebaut, damit
+  // ungespeicherte Eingaben im Formular erhalten bleiben.
+  let files = (pool.files || []).slice();
+
+  const repaint = () => {
+    files.sort((one, other) => one.name.localeCompare(other.name));
+
+    if (!files.length) {
+      list.replaceChildren(el('p', {class: 'hint'}, [el('div', {text: 'Noch nichts hochgeladen.'})]));
+      return;
+    }
+
+    list.replaceChildren(...files.map(file => poolFileRow(pool.key, file, files, repaint, status)));
+  };
+
+  const number = pool.numbered
+    ? el('input', {type: 'tel', required: '', placeholder: 'Rufnummer', 'aria-label': 'Rufnummer'})
+    : null;
+
+  const upload = uploadButton('Hochladen',
+    file => uploadPoolFile(pool, file, number ? number.value : '', files, repaint, status));
+
+  const node = el('div', {class: 'pool', 'data-pool': pool.key}, [
+    el('p', {class: 'hint'}, (pool.help || []).map(h => el('div', {text: h}))),
+    list,
+    status,
+    number === null ? upload : el('div', {class: 'pool-upload'}, [number, upload]),
+  ]);
+
+  repaint();
+  return node;
+}
+
+function poolFileRow(pool, file, files, repaint, status) {
+  const own = el('div', {class: 'status', 'data-row-status': ''});
+
+  const previewButton = el('button', {
+    type: 'button', class: 'small', text: 'Vorschau',
+    onclick: () => togglePreview(poolUrl(pool, file.name), previewButton, own),
+  });
+
+  return el('div', {class: 'sound-row', 'data-file': file.name}, [
+    el('span', {class: 'sound-file'}, [
+      el('span', {text: `${file.name} (${formatSize(file.size)})`}),
+      // Jeder Klingelton in der Liste gehört genau einer Rufnummer, und sein
+      // Name sagt, welcher - das ist der ganze Unterschied zwischen den Dateien.
+      file.caller ? el('span', {class: 'caller', text: `nur für ${file.caller}`}) : null,
+    ]),
+    previewButton,
+    el('button', {
+      type: 'button', class: 'small danger', text: 'Löschen', title: 'Datei entfernen',
+      // Die Meldung landet an der Liste, nicht an der Zeile: die Zeile ist
+      // danach weg, und die Meldung soll trotzdem zu sehen sein.
+      onclick: () => deletePoolFile(pool, file.name, files, repaint, status),
+    }),
+    own,
+  ]);
+}
+
+async function uploadPoolFile(pool, file, number, files, repaint, status) {
+  let name = file.name;
+
+  if (pool.numbered) {
+    const digits = String(number || '').replace(/\D/g, '');
+    if (!digits) {
+      say(status, 'Ohne Rufnummer gibt es keinen Namen, unter dem die Datei wiedergefunden wird.', 'err');
+      return;
+    }
+    name = `ringtone-${digits}.${extensionOf(file)}`;
+  }
+
+  say(status, `${file.name || 'Datei'} wird hochgeladen …`);
+
+  try {
+    const result = await answer(await fetch(poolUrl(pool.key, name), {method: 'POST', body: file}));
+    if (!result.ok) throw new Error(result.error || 'Hochladen fehlgeschlagen');
+
+    // Der Server nennt den Namen, unter dem die Datei liegt: Leerzeichen und
+    // andere unbrauchbare Zeichen hat er dabei ersetzt.
+    const stored = result.file;
+    const known = files.findIndex(entry => entry.name === stored.name);
+    if (known >= 0) files[known] = stored;
+    else files.push(stored);
+
+    repaint();
+    say(status, `${stored.name} gespeichert.`);
+  } catch (e) {
+    console.error(e);
+    say(status, e.message, 'err');
+  }
+}
+
+async function deletePoolFile(pool, name, files, repaint, status) {
+  if (!confirm(`"${name}" wirklich löschen?`)) return;
+
+  say(status, `${name} wird gelöscht …`);
+
+  try {
+    const result = await answer(await fetch(poolUrl(pool, name), {method: 'DELETE'}));
+    if (!result.ok) throw new Error(result.error || 'Löschen fehlgeschlagen');
+
+    const known = files.findIndex(entry => entry.name === name);
+    if (known >= 0) files.splice(known, 1);
+
+    repaint();
+    say(status, `${name} gelöscht.`);
+  } catch (e) {
+    console.error(e);
+    say(status, e.message, 'err');
+  }
+}
+
+function renderSounds(sounds) {
+  const node = el('section', {class: 'config sounds'}, [
+    el('h2', {text: 'Klänge'}),
+    el('p', {class: 'hint'}, [el('div', {
+      text: 'Diese Klänge spielt das Telefon. Sie werden hier hochgeladen und gelten ' +
+            'sofort - ohne Neustart. Ein fester Klang ohne Datei bleibt stumm; die ' +
+            'Listen sind leer, bis etwas hochgeladen wird.',
+    })]),
+  ]);
+
+  for (const sound of (sounds && sounds.fixed) || []) node.append(soundRow(sound));
+  for (const pool of (sounds && sounds.pools) || []) {
+    node.append(el('h3', {text: pool.label}));
+    node.append(poolSection(pool));
+  }
+
+  return node;
+}
+
 // ---------------------------------------------------------------- Laden und Speichern
 
 const savedBanner = (changed = [], dropped = []) => {
@@ -481,7 +788,17 @@ const savedBanner = (changed = [], dropped = []) => {
 
 function render(config) {
   const form = document.getElementById('form');
-  form.replaceChildren(...config.sections.map(renderSection));
+  // Eine laufende Vorschau gehört zu einer Zeile, die gleich ersetzt wird.
+  stopPreview();
+
+  const sections = config.sections.map(renderSection);
+  // Die Klänge gehören vor das Nachtlicht, wo früher der gleichnamige Abschnitt
+  // der Konfiguration stand: sie sind Dateien und keine Optionen, und sie lassen
+  // sich deshalb nur schwer an anderer Stelle unterbringen.
+  const before = sections.findIndex(section => section.dataset.section === 'misc');
+  sections.splice(before < 0 ? sections.length : before, 0, renderSounds(config.sounds));
+
+  form.replaceChildren(...sections);
   document.getElementById('save').disabled = false;
 
   // Ladehinweis entfernen und nur zeigen, wenn die Konfiguration vom laufenden

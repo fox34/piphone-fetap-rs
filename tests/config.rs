@@ -93,7 +93,7 @@ fn example_configuration_is_valid_and_round_trips() {
     let sections: Vec<&str> = text.lines().filter(|l| l.starts_with('[')).collect();
     assert_eq!(
         sections,
-        vec!["[network]", "[sip]", "[pins]", "[numbers]", "[ringtones]", "[sounds]", "[misc]", "[web]"]
+        vec!["[network]", "[sip]", "[pins]", "[numbers]", "[misc]", "[web]"]
     );
 
     assert!(text.contains("\"01\" = \"01234567\""), "Kurzwahl muss quotiert sein");
@@ -126,7 +126,6 @@ fn missing_required_options_are_reported_in_schema_order() {
     assert!(!config::option_bool(&empty, "sip", "whitelist_active"));
     assert!(config::option_list(&empty, "misc", "wake_up_times").is_empty());
     assert_eq!(config::option_int(&empty, "misc", "night_light_pin"), 0);
-    assert!(config::option_list(&empty, "sounds", "sleep_music").is_empty());
 }
 
 #[test]
@@ -146,13 +145,10 @@ fn values_from_the_form_keep_their_types() {
 
     // Text stays text.
     assert_eq!(section_of(&cleaned, "sip")["pass"], Val::Str("test".into()));
-    assert!(section_of(&cleaned, "ringtones")["08912345"]
-        .to_display_string()
-        .ends_with(".wav"));
+    assert_eq!(section_of(&cleaned, "numbers")["01"].to_display_string(), "01234567");
 
     // Lists stay lists.
     assert!(matches!(section_of(&cleaned, "misc")["wake_up_times"], Val::List(_)));
-    assert!(matches!(section_of(&cleaned, "sounds")["sleep_music"], Val::List(_)));
 }
 
 // -----------------------------------------------------------------------------
@@ -265,12 +261,6 @@ fn wake_up_times_must_be_well_formed() {
     assert!(errors_of(&[("misc", hour_25)]).get("misc.wake_up_times").is_some());
 }
 
-#[test]
-fn sleep_music_accepts_empty_and_multiple_tracks() {
-    assert!(errors_of(&[("sounds", &[("sleep_music", "[]")])]).is_empty());
-    assert!(errors_of(&[("sounds", &[("sleep_music", "[\"/a.mp3\", \"/b.mp3\"]")])]).is_empty());
-}
-
 // ---------------------------------------------------------------- short codes
 
 #[test]
@@ -316,15 +306,33 @@ fn short_codes_accept_country_prefixes() {
     assert!(errors_of(&[("numbers", codes)]).is_empty());
 }
 
-// ------------------------------------------------------------------- ringtones
+// ------------------------------------------------------------------- Klingeltöne
 
+/// The ringtones are uploaded files whose names say who they ring for, and the
+/// sleep music is a list of them. Nothing of that is an option any more, so a
+/// file that still has the old sections names something the phone reads no more -
+/// and the next save would take it away, so it has to be said out loud like any
+/// other entry the schema does not know.
 #[test]
-fn ringtones_need_a_file_and_accept_any_key() {
-    assert!(errors_of(&[("ringtones", &[("0891234", "\"/opt/ring.wav\"")])]).is_empty());
-    assert!(errors_of(&[("ringtones", &[("089", "\"\"")])]).get("ringtones.089").is_some());
+fn the_old_sound_sections_are_reported_as_unknown() {
+    let data = with(&[
+        ("sounds", &[("ring", "\"/usr/local/share/piphone/sounds/ring-01.wav\"")]),
+        ("ringtones", &[("0891234", "\"/usr/local/share/piphone/sounds/ring-02.wav\"")]),
+    ]);
 
-    let many: &[(&str, &str)] = &[("\"+49891234\"", "\"/a.wav\""), ("0049891234", "\"/b.wav\"")];
-    assert!(errors_of(&[("ringtones", many)]).is_empty());
+    assert_eq!(
+        config::unknown(&data),
+        vec!["[ringtones]".to_string(), "[sounds]".to_string()]
+    );
+
+    let (cleaned, errors) = config::validate(&data);
+    assert!(errors.is_empty());
+    assert!(!cleaned.contains_key("sounds"), "alter Abschnitt behalten");
+    assert!(!cleaned.contains_key("ringtones"), "Klingeltöne behalten");
+
+    let dumped = config::dump(&cleaned);
+    assert!(!dumped.contains("[sounds]"), "alter Abschnitt in der Datei");
+    assert!(!dumped.contains("[ringtones]"), "Klingeltöne in der Datei");
 }
 
 // -----------------------------------------------------------------------------
@@ -365,11 +373,11 @@ fn unknown_options_and_sections_are_dropped() {
     assert_eq!(reloaded, cleaned);
 }
 
-/// Every key in `[numbers]` and `[ringtones]` is a short code or a number, not a
-/// schema key - so none of them can be "unknown".
+/// Every key in `[numbers]` is a short code or a number, not a schema key - so
+/// none of them can be "unknown".
 #[test]
 fn entry_tables_are_not_unknown() {
-    let data = with(&[("numbers", &[("42", "\"01299999\"")]), ("ringtones", &[("0891234", "\"/a.wav\"")])]);
+    let data = with(&[("numbers", &[("42", "\"01299999\"")])]);
     assert!(config::unknown(&data).is_empty());
     assert!(config::validate(&data).0.contains_key("numbers"));
 }
@@ -394,9 +402,11 @@ fn writes_through_a_temporary_file() {
     assert!(saved.changed.is_empty());
 
     let stored = config::read(&path).unwrap();
-    for section in ["network", "sip", "pins", "numbers", "ringtones", "sounds", "misc", "web"] {
+    for section in ["network", "sip", "pins", "numbers", "misc", "web"] {
         assert!(stored.contains_key(section), "Abschnitt {} fehlt", section);
     }
+    assert!(!stored.contains_key("sounds"), "Abschnitt [sounds] gehört nicht mehr in die Datei");
+    assert!(!stored.contains_key("ringtones"), "Klingeltöne gehören nicht mehr in die Datei");
 
     // Now add a short code, remove one, and change two values.
     let mut edited = baseline.clone();
