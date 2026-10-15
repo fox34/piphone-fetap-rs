@@ -40,6 +40,7 @@ A sample feature-complete configuration file is provided in `support/config-exam
 - Read AGENTS.override.md, if it exists.
 - Always ask before installing system-wide applications (e.g. via `apt`).
 - Always ask before changing system-wide settings (e.g. systemd services).
+- Increment the version on each change, but at most once per git commit.
 
 # Building
 
@@ -53,6 +54,12 @@ A sample feature-complete configuration file is provided in `support/config-exam
 - Configuration goes to /usr/local/etc/piphone/piphone.toml
 - Sound files go to /usr/local/share/piphone/
 - Release binary goes to /usr/local/bin
+
+`scripts/deploy.sh` does the whole round trip: rsync the sources to the Pi 5, `cargo build --release`
+there, sanity-check the binary, copy it to the Pi Zero 2W and restart `piphone`. It keeps no backup
+of the previous binary (stage, checksum, atomic rename, then restart), and refuses to restart while a
+call is in progress unless `--force` is given. `--no-restart` installs without touching the running
+service, `--skip-build` redeploys the binary already built on the Pi 5.
 
 # Layout
 

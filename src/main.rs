@@ -7,9 +7,16 @@ use piphone::phone::Options;
 use piphone::webserver;
 use piphone::Phone;
 
-const HELP: &str = "\
+/// The version is taken from `Cargo.toml` through the environment, so the help
+/// cannot fall behind the package version.
+const HELP: &str = concat!(
+    "\
 Steuerung für ein Raspberry-Pi-basiertes Headless-Telefon im Gehäuse alter Telefone (bspw. FeTAp).
 Koordiniert Hörer, Lautsprecher, Gabelkontakt, Nummernschalter und SIP-Client (rvoip).
+
+Version: ",
+    env!("CARGO_PKG_VERSION"),
+    "
 
 Aufruf:
   piphone [Optionen]
@@ -22,7 +29,8 @@ Optionen:
       --silent-boot      Keinen Start-Sound abspielen
   -v, --verbose           Ausführliches Logging aktivieren
   -h, --help              Diese Hilfe anzeigen
-";
+"
+);
 
 fn main() {
     let options = match parse_args() {
