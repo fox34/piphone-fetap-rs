@@ -49,28 +49,6 @@ A sample feature-complete configuration file is provided in `support/config-exam
 - Access to a Raspberry Pi 5 with 4GB of RAM can be provided for compiling the production version.
 - Avoid compiling debug binaries on the Raspberry Pi 5 for efficiency reasons.
 
-# Deployment
-
-- Configuration goes to /usr/local/etc/piphone/piphone.toml
-- Sound files go to /usr/local/share/piphone/
-- Release binary goes to /usr/local/bin
-
-`scripts/deploy.sh` does the whole round trip: rsync the sources to the Pi 5, `cargo build --release`
-there, sanity-check the binary, copy it to the Pi Zero 2W and restart `piphone`. It keeps no backup
-of the previous binary (stage, checksum, atomic rename, then restart), and refuses to restart while a
-call is in progress unless `--force` is given. `--no-restart` installs without touching the running
-service, `--skip-build` redeploys the binary already built on the Pi 5.
-
-`scripts/package-deb.sh` builds a `.deb` from the same sources instead of copying files around: it
-takes the release binary (from the build host with `--from`, from `target/` or with `--build`), the
-default sounds from `support/sounds`, `support/config-example.toml` as a conffile and the units from
-`support/etc/`. A `.deb` is an `ar` archive, so it is assembled with `ar`, `tar` and `gzip` and the
-script runs on macOS too; `dpkg-deb` verifies the result where it exists. The `ring-NN` files in
-`support/sounds/ringtones` are not installed by default, because which caller number rings with which
-file is a decision of whoever installs: `--ringtone <Rufnummer>=<datei>` maps one, and the script
-names the ones it leaves out. The sleep music is deliberately not packaged - those titles are
-third-party works.
-
 # Layout
 
 | Path | Contents |
@@ -215,13 +193,16 @@ many labels as it requires entries, because the form sends one value per field i
 labels; `labelled_lists_have_one_field_per_entry` asserts that, and it holds for every option, so a
 new one cannot get it wrong quietly.
 
-Changes are never applied to the running process and never trigger a restart; the UI points out
-that a restart is required. Writing the file regenerates all comments from the schema, so comments
-written by hand in the file are not preserved. For the same reason `dump` writes the file from
-`SECTIONS` alone and an entry no option exists for is *dropped* rather than carried over: a leftover
-from another version would otherwise sit in the file forever, unread and untended. That is data
-loss, so it is not silent - `config::unknown` names what is there at startup and `Saved::dropped`
-names what a save removed, which the page prints next to the restart notice.
+Changes are never applied to the running process: the file is read once at startup, so a save from
+the web interface restarts the **service** once the answer is on its way (`Phone::restart`, `systemctl
+restart --no-block piphone`) and nothing else. The machine is only rebooted when somebody asks for it
+deliberately - the `reboot` short code and the button named "Neustart". Writing the file regenerates
+all comments from the schema, so comments written by hand in the file are not preserved. For the same
+reason `dump` writes the file from `SECTIONS` alone and an entry no option exists for is *dropped*
+rather than carried over: a leftover from another version would otherwise sit in the file forever,
+unread and untended. That is data loss, so it is not silent - `config::unknown` names what is there
+at startup and `Saved::dropped` names what a save removed, which the page prints next to the note
+about the restart.
 
 The file is saved through a temporary file that is written, read back, compared and only then moved
 into place. Its name carries the process id *and* a counter, because two tabs in a browser are

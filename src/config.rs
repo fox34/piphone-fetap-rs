@@ -232,8 +232,6 @@ pub struct OptionSpec {
     /// Für `ValueType::List`: `type` der einzelnen Eingabefelder bei `item_labels`
     pub item_input: &'static str,
     pub item_hint: &'static str,
-    /// Änderung wird erst nach einem Neustart wirksam
-    pub restart: bool,
 }
 
 impl OptionSpec {
@@ -253,7 +251,6 @@ impl OptionSpec {
             item_labels: &[],
             item_input: "text",
             item_hint: "",
-            restart: false,
         }
     }
 
@@ -274,11 +271,6 @@ impl OptionSpec {
 
     pub fn secret(mut self) -> Self {
         self.secret = true;
-        self
-    }
-
-    pub fn restart(mut self) -> Self {
-        self.restart = true;
         self
     }
 
@@ -364,16 +356,13 @@ pub static SECTIONS: LazyLock<Vec<SectionSpec>> = LazyLock::new(|| {
             vec![
                 OptionSpec::new("host", "SIP-Server", ValueType::String)
                     .required()
-                    .restart()
                     .comment(&["Adresse des SIP-Servers, bspw. die FRITZ!Box."]),
                 OptionSpec::new("user", "SIP-Benutzer", ValueType::String)
                     .required()
-                    .restart()
                     .comment(&["SIP-Benutzername."]),
                 OptionSpec::new("pass", "SIP-Passwort", ValueType::String)
                     .required()
                     .secret()
-                    .restart()
                     .comment(&["SIP-Passwort."]),
                 OptionSpec::new("dial_timeout", "Wählvorgang Timeout (s)", ValueType::Int)
                     .default(Val::Int(60))
@@ -402,17 +391,14 @@ pub static SECTIONS: LazyLock<Vec<SectionSpec>> = LazyLock::new(|| {
             vec![
                 OptionSpec::new("nsi", "Nummernschalter NSI", ValueType::Int)
                     .required()
-                    .restart()
                     .range(Some(0.0), Some(GPIO_PIN_MAX))
                     .comment(&["Nummern-Schalter-Impuls-Kontakt."]),
                 OptionSpec::new("nsa", "Nummernschalter NSA", ValueType::Int)
                     .required()
-                    .restart()
                     .range(Some(0.0), Some(GPIO_PIN_MAX))
                     .comment(&["Nummern-Schalter-Arbeits- (oder Abschalte-)Kontakt."]),
                 OptionSpec::new("gabel", "Gabelkontakt", ValueType::Int)
                     .required()
-                    .restart()
                     .range(Some(0.0), Some(GPIO_PIN_MAX))
                     .comment(&["Gabelkontakt."]),
             ],
@@ -442,22 +428,18 @@ pub static SECTIONS: LazyLock<Vec<SectionSpec>> = LazyLock::new(|| {
                 OptionSpec::new("night_light_pin", "Nachtlicht: GPIO-Pin", ValueType::Int)
                     .default(Val::Int(0))
                     .range(Some(0.0), Some(GPIO_PIN_MAX))
-                    .restart()
                     .comment(&["GPIO-Pin für Nachtlicht (0 = deaktiviert)."]),
                 OptionSpec::new("night_light_duty", "Nachtlicht: Helligkeit (%)", ValueType::Float)
                     .default(Val::Int(50))
                     .range(Some(0.0), Some(DUTY_MAX))
-                    .restart()
                     .comment(&["Nachtlicht: Helligkeit in Prozent (100 = PWM deaktiviert, volle Leistung des GPIO)."]),
                 OptionSpec::new("wake_light_pin", "Aufwachlicht: GPIO-Pin", ValueType::Int)
                     .default(Val::Int(0))
                     .range(Some(0.0), Some(GPIO_PIN_MAX))
-                    .restart()
                     .comment(&["GPIO-Pin für Aufwach-Licht (0 = deaktiviert)."]),
                 OptionSpec::new("wake_light_duty", "Aufwachlicht: Helligkeit (%)", ValueType::Float)
                     .default(Val::Int(100))
                     .range(Some(0.0), Some(DUTY_MAX))
-                    .restart()
                     .comment(&["Aufwach-Licht: Helligkeit in Prozent (100 = PWM deaktiviert, volle Leistung des GPIO)."]),
                 OptionSpec::new("wake_up_times", "Aufstehzeiten", ValueType::List)
                     .default(Val::List(Vec::new()))
@@ -477,11 +459,9 @@ pub static SECTIONS: LazyLock<Vec<SectionSpec>> = LazyLock::new(|| {
                 OptionSpec::new("port", "Port", ValueType::Int)
                     .default(Val::Int(0))
                     .range(Some(0.0), Some(PORT_MAX))
-                    .restart()
                     .comment(&["Port des Webservers, 0 = deaktiviert."]),
                 OptionSpec::new("user", "Benutzer", ValueType::String)
                     .default(str_val(""))
-                    .restart()
                     .comment(&[
                         "Optionaler Zugangsschutz (HTTP Basic Auth).",
                         "Achtung: Ohne Zugangsschutz kann jeder im WLAN das Telefon herunterfahren",
@@ -491,7 +471,6 @@ pub static SECTIONS: LazyLock<Vec<SectionSpec>> = LazyLock::new(|| {
                 OptionSpec::new("pass", "Passwort", ValueType::String)
                     .default(str_val(""))
                     .secret()
-                    .restart()
                     .comment(&["Zum Benutzerfeld gehörendes Passwort."]),
             ],
         ),
@@ -1097,7 +1076,6 @@ pub fn describe(data: &Table) -> Json {
                     // Wochentag) statt einer Zeile je Eintrag im Textfeld.
                     "item_labels": option.item_labels,
                     "item_input": option.item_input,
-                    "restart": option.restart,
                 })
             })
             .collect();

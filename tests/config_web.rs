@@ -119,6 +119,9 @@ fn schema_of(phone: &FilePhone) -> Json_ {
 }
 
 /// Save through the real `config::save` and report what the phone would answer.
+///
+/// The third value is whether the change would restart the phone service, which
+/// is what the phone does with it afterwards: only a real change restarts anything.
 fn save(phone: &FilePhone, payload: &Json_) -> (bool, Vec<String>, bool, Json_) {
     let incoming = config::from_json(payload);
 
@@ -131,9 +134,9 @@ fn save(phone: &FilePhone, payload: &Json_) -> (bool, Vec<String>, bool, Json_) 
             (false, Vec::new(), false, json!({ "errors": Json_::Object(map) }))
         }
         Ok(saved) => {
-            let has_changes = !saved.changed.is_empty();
+            let restarted = !saved.changed.is_empty();
             let changed = saved.changed.clone();
-            (true, changed, has_changes, json!({}))
+            (true, changed, restarted, json!({}))
         }
     }
 }
@@ -205,13 +208,13 @@ fn reports_only_the_sections_that_changed() {
         &schema_of(&phone),
         &json!({ "sip": { "dial_timeout": "90" }, "misc": { "night_light_pin": "17" } }),
     );
-    let (ok, changed, restart, _) = save(&phone, &form);
+    let (ok, changed, restarted, _) = save(&phone, &form);
 
     assert!(ok);
     let mut reported = changed.clone();
     reported.sort();
     assert_eq!(reported, vec!["[misc]", "[sip]"]);
-    assert!(restart, "Neustart muss verlangt werden");
+    assert!(restarted, "der Dienst muss neu starten");
 
     let stored = phone.stored();
     assert_eq!(config::option_int(&stored, "sip", "dial_timeout"), 90);
@@ -234,11 +237,11 @@ fn saving_unchanged_leaves_the_file_alone() {
 
     let before = std::fs::read_to_string(&path).unwrap();
     let form = as_browser_sends(&schema_of(&phone), &json!({}));
-    let (ok, changed, restart, _) = save(&phone, &form);
+    let (ok, changed, restarted, _) = save(&phone, &form);
 
     assert!(ok);
     assert!(changed.is_empty(), "unerwartete Änderung: {:?}", changed);
-    assert!(!restart);
+    assert!(!restarted, "ohne Änderung darf nichts neu starten");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "Datei wurde verändert");
 }
 
@@ -427,7 +430,8 @@ fn saving_never_touches_the_running_configuration() {
     let form = as_browser_sends(&schema_of(&phone), &json!({ "sip": { "dial_timeout": "5" } }));
     save(&phone, &form);
 
-    // The file changed, but the phone still runs with what it started with.
+    // The file changed, but the phone still runs with what it started with - it
+    // is a new process that reads the change, never this one.
     assert_eq!(config::option_int(&phone.stored(), "sip", "dial_timeout"), 5);
     assert_eq!(
         config::option_int(&phone.baseline, "sip", "dial_timeout"),
@@ -436,6 +440,7 @@ fn saving_never_touches_the_running_configuration() {
     );
 }
 
+/// Saving restarts the phone service and nothing else
 #[test]
 fn saving_does_not_trigger_any_action() {
     let (_dir, path) = workspace();

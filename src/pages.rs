@@ -57,7 +57,6 @@ pub const PAGE: &str = r##"<!DOCTYPE html>
   <div class="row"><span>Einschlafmusik</span><span id="sleep_music">–</span></div>
   <div class="row"><span>Nicht stören</span><span id="dnd">–</span></div>
   <div class="row"><span>Nächstes Aufstehen</span><span id="next_wake_up">–</span></div>
-  <div class="row"><span>Konfiguration</span><span id="config_changed">–</span></div>
 </section>
 
 <div class="buttons">
@@ -99,10 +98,6 @@ async function refresh() {
     }
     document.getElementById('sip').textContent = state.call_active ? 'Gespräch aktiv' : state.sip_registered ? 'Bereit' : 'Nicht verfügbar';
     document.getElementById('next_wake_up').textContent = formatDate(state.next_wake_up);
-
-    const changed = document.getElementById('config_changed');
-    changed.textContent = state.config_changed ? 'Geändert, Neustart nötig' : 'Unverändert';
-    changed.className = state.config_changed ? 'off' : '';
 
     document.getElementById('night-mode-button').classList.toggle('on', state.night_light);
     document.getElementById('sleep-music-button').classList.toggle('on', state.sleep_music);
@@ -234,9 +229,8 @@ pub const CONFIG_PAGE: &str = r##"<!DOCTYPE html>
 
 <div class="sticky">
   <div class="buttons">
-    <button id="save" disabled>Speichern</button>
+    <button id="save" disabled>Speichern und neu starten</button>
     <button id="reload" class="small">Neu laden</button>
-    <button data-action="reboot" class="small danger" style="margin-left:auto">Neustart</button>
   </div>
 </div>
 
@@ -501,9 +495,7 @@ function renderSection(section) {
 const soundUrl = key => `/api/sound/${encodeURIComponent(key)}`;
 const poolUrl = (pool, name) => `/api/sound/${encodeURIComponent(pool)}/${encodeURIComponent(name)}`;
 
-// Die Endung, unter der eine Auswahl hochgeladen wird. Welches Format sie
-// wirklich hat, entscheidet der Server am Inhalt; hier steht nur, was der
-// Browser für eine Endung hält.
+// Die Endung, unter der eine Auswahl hochgeladen wird. Welches Format sie hat, entscheidet der Server am Inhalt
 const extensionOf = file => {
   const match = /\.([a-z0-9]{1,5})$/i.exec(file.name || '');
   return match ? match[1] : 'wav';
@@ -783,7 +775,7 @@ const savedBanner = (changed = [], dropped = []) => {
   // Beim Speichern fällt weg, was das Schema nicht kennt. Das gehört in die
   // Meldung, sonst verschwindet der Eintrag ersatzlos.
   if (dropped.length) items.push('Unbekannte Einträge wurden entfernt: ' + dropped.join(', '));
-  return banner('warn', 'Das Telefon muss neu gestartet werden, damit die Änderungen wirksam werden.', items);
+  return banner('warn', 'Der Telefondienst startet neu, damit die Änderungen wirksam werden.', items);
 };
 
 function render(config) {
@@ -801,16 +793,10 @@ function render(config) {
   form.replaceChildren(...sections);
   document.getElementById('save').disabled = false;
 
-  // Ladehinweis entfernen und nur zeigen, wenn die Konfiguration vom laufenden
-  // Betrieb abweicht - nach dem Speichern wird die Meldung gezielt gesetzt.
-  if (config.restart_required) {
-    document.getElementById('message').replaceChildren(
-      banner('warn', 'Seit dem letzten Start wurde die Konfiguration geändert. ' +
-                      'Sie wird erst nach einem Neustart des Telefons verwendet.')
-    );
-  } else {
-    document.getElementById('message').replaceChildren();
-  }
+  // Der Ladehinweis ist jetzt überflüssig. Eine gespeicherte Konfiguration
+  // meldet sich danach von selbst - die Änderung ist nicht mehr offen, das
+  // Telefon startet sich neu, sobald sie geschrieben ist.
+  document.getElementById('message').replaceChildren();
 }
 
 async function load() {
@@ -860,12 +846,6 @@ document.getElementById('save').addEventListener('click', async () => {
 });
 
 document.getElementById('reload').addEventListener('click', load);
-
-document.querySelectorAll('button[data-action]').forEach(button => button.addEventListener('click', async () => {
-  if (!confirm('Telefon wirklich neu starten? Die Konfiguration wird erst danach wirksam.')) return;
-  button.disabled = true;
-  await fetch(`/api/action/${button.dataset.action}`, {method: 'POST'});
-}));
 
 load();
 </script>

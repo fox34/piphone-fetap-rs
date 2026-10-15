@@ -37,7 +37,6 @@ impl PhoneApi for Arc<Phone> {
             // weekday.
             "next_wake_up": lock(&self.next_wake_up)
                 .map(|t| t.format("%Y-%m-%dT%H:%M:%S").to_string()),
-            "config_changed": self.config_changed.load(Ordering::SeqCst),
         })
     }
 
@@ -51,7 +50,6 @@ impl PhoneApi for Arc<Phone> {
             // eine zweite Wahrheit, die nach dem Speichern auseinanderlaufen kann.
             "sounds": sounds::describe(&self.options.sounds_dir),
             "mtime": *lock(&self.config_mtime),
-            "restart_required": self.config_changed.load(Ordering::SeqCst),
         })
     }
 
@@ -96,17 +94,14 @@ impl PhoneApi for Arc<Phone> {
         *lock(&self.baseline) = saved.cleaned;
         *lock(&self.config_mtime) = modified(&self.options.config).unwrap_or(0.0);
 
-        // Ohne echte Änderung ist kein Neustart nötig.
-        let has_changes = !changed.is_empty();
-        if has_changes {
-            self.config_changed.store(true, Ordering::SeqCst);
+        if !changed.is_empty() {
+            self.restart();
         }
 
         serde_json::json!({
             "ok": true,
             "changed": changed,
             "dropped": dropped,
-            "restart_required": has_changes
         })
     }
 

@@ -36,6 +36,18 @@ use crate::sync::lock;
 /// [`crate::callaudio::CALL_DEVICE`] for why the plugin wrapper is needed.
 const EARPIECE_ALSA: &str = crate::callaudio::CALL_DEVICE;
 
+/// The systemd unit this process runs as. Restarting it replaces this process
+/// with a new one; see [`Phone::restart`].
+const SERVICE: &str = "piphone";
+
+/// How long [`Phone::restart`] waits before asking for it.
+///
+/// Only long enough for the answer to the request that asked for it to leave:
+/// systemd sends SIGTERM to this process while stopping the service, which is
+/// the same signal it would get on a deploy, and the phone hangs the call up
+/// and exits cleanly in [`crate::phone::Phone::stop_sip`].
+const RESTART_DELAY: Duration = Duration::from_secs(2);
+
 /// Longest short code the rotary dial may produce.
 const MAX_DIAL_CODE: usize = config::MAX_DIAL_CODE;
 
@@ -73,7 +85,6 @@ pub struct Phone {
     /// Normalised configuration as a baseline for the web interface.
     baseline: Mutex<Table>,
     config_mtime: Mutex<f64>,
-    config_changed: AtomicBool,
 
     audio: Audio,
     led: Arc<Led>,
@@ -297,7 +308,6 @@ impl Phone {
             config,
             baseline: Mutex::new(baseline),
             config_mtime: Mutex::new(config_mtime),
-            config_changed: AtomicBool::new(false),
             audio: Audio::default(),
             led,
             hungup,
@@ -951,6 +961,18 @@ impl Phone {
         println!("Starte System neu.");
         self.audio.play_speaker(&self.sound(Sound::Reboot)).wait();
         let _ = std::process::Command::new("systemctl").args(["reboot", "-i"]).status();
+    }
+
+    /// Restart the service, so that a new configuration takes effect.
+    pub fn restart(&self) {
+        println!("Starte Telefondienst neu.");
+
+        std::thread::spawn(|| {
+            std::thread::sleep(RESTART_DELAY);
+            let _ = std::process::Command::new("systemctl")
+                .args(["restart", "--no-block", SERVICE])
+                .status();
+        });
     }
 
     /// Power the phone down after playing a tone.

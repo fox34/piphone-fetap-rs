@@ -43,7 +43,6 @@ impl PhoneApi for StubPhone {
             "sections": config::describe(&example()),
             "sounds": sounds::describe(&self.sounds),
             "mtime": 1000.0,
-            "restart_required": false,
         })
     }
 

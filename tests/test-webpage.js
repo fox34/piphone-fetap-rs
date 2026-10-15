@@ -93,23 +93,9 @@ setTimeout(async () => {
   check('Speichern erst nach dem Laden aktiv', doc.getElementById('save').disabled === false);
   check('unveränderte Konfiguration zeigt keinen Hinweis', doc.querySelector('#message').children.length === 0,
     doc.querySelector('#message').textContent);
-
-  // Konfiguration, die seit dem letzten Start geändert wurde, weist auf den Neustart hin
-  window.fetch = async () => ({json: async () => ({...configPayload, restart_required: true})});
-  window.eval('load()');
-  await new Promise(resolve => setTimeout(resolve, 50));
-  check('Hinweis auf Neustart sichtbar', doc.querySelector('.banner.warn') !== null);
-  check('Hinweis nennt Neustart',
-    doc.querySelector('.banner.warn') !== null &&
-    doc.querySelector('.banner.warn').textContent.includes('Neustart'),
-    doc.querySelector('#message').textContent);
-
-  window.fetch = async (url, options) => {
-    requests.push({url, options});
-    return {json: async () => JSON.parse(JSON.stringify(configPayload))};
-  };
-  window.eval('load()');
-  await new Promise(resolve => setTimeout(resolve, 50));
+  check('Speichern startet das Telefon neu',
+    doc.getElementById('save').textContent.includes('neu starten'),
+    doc.getElementById('save').textContent);
 
   console.log('Werte aus der Konfiguration übernommen');
   const value = selector => doc.querySelector(`[data-section="sip"] [data-field="${selector}"] input`).value;
@@ -312,7 +298,7 @@ setTimeout(async () => {
     pool('ringtones').querySelectorAll('[data-file]').length === 1 &&
     pool('ringtones').querySelector('[data-file="Ring-01.wav"]') === null,
     [...pool('ringtones').querySelectorAll('[data-file]')].map(n => n.dataset.file).join(','));
-  check('Upload löst keinen Neustart aus',
+  check('Upload startet keinen Neustart aus',
     requests.filter(r => r.url && r.url.includes('/api/action/')).length === 0);
 
   window.fetch = async (url, options) => {
@@ -422,11 +408,11 @@ setTimeout(async () => {
   await new Promise(resolve => setTimeout(resolve, 50));
   check('Fehlermarkierungen entfernt',
     doc.querySelectorAll('.invalid').length === 0 && doc.querySelectorAll('.error').length === 0);
-  check('Hinweis auf Neustart nach dem Speichern',
+  check('Hinweis auf den Neustart des Dienstes nach dem Speichern',
     doc.querySelector('.banner.warn') !== null &&
-    doc.querySelector('.banner.warn').textContent.includes('neu gestartet'),
+    doc.querySelector('.banner.warn').textContent.includes('startet neu'),
     doc.querySelector('.banner.warn') && doc.querySelector('.banner.warn').textContent);
-  check('Neustart wird nicht automatisch ausgelöst',
+  check('Speichern startet keinen Systemneustart aus',
     requests.filter(r => r.url && r.url.includes('/api/action/')).length === 0);
 
   console.log('Formularverhalten');

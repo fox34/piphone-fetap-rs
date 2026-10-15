@@ -72,7 +72,7 @@ wake_up_times = ["06:30", "06:30", "06:30", "06:30", "06:30", "07:30", "07:30"]
 # Webserver zur Anzeige und Steuerung des Telefons (im WLAN erreichbar)
 [web]
 # Port des Webservers, 0 = deaktiviert
-port = 0
+port = 80
 
 # Optionaler Zugangsschutz (HTTP Basic Auth).
 # Achtung: Ohne Zugangsschutz kann jeder im WLAN das Telefon herunterfahren!
