@@ -65,6 +65,7 @@ A sample feature-complete configuration file is provided in `support/config-exam
 | `src/sounds.rs` | The sound files the phone plays: fixed names, uploading, preview |
 | `src/command.rs` | The features and the names the dial and the web URL use for them |
 | `src/sync.rs` | `lock()`, the one place that says how poisoning is handled |
+| `src/lockfile.rs` | The `flock` that keeps a second instance off the hardware |
 | `src/webserver.rs` | axum routes, basic auth, actions |
 | `src/pages.rs` | The HTML pages, rendered from the schema |
 | `src/main.rs` | Argument parsing and startup |

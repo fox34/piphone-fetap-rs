@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use piphone::lockfile::{self, InstanceLock};
 use piphone::phone::Options;
 use piphone::webserver;
 use piphone::Phone;
@@ -42,6 +43,19 @@ fn main() {
         }
     };
 
+    // Only one instance may use the dial, the LEDs and the sound card. 
+    // `lock` lives until the end of `main`, which is what
+    // holds the claim for as long as the phone runs.
+    let lock_path = lockfile::default_path();
+    let lock = match InstanceLock::acquire(&lock_path) {
+        Ok(lock) => lock,
+        Err(message) => {
+            eprintln!("{}", message);
+            std::process::exit(1);
+        }
+    };
+    println!("Sperrdatei: {}", lock.path().display());
+
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(e) => {
@@ -54,12 +68,18 @@ fn main() {
         eprintln!("{}", message);
         std::process::exit(1);
     }
+
+    drop(lock);
 }
 
 /// Parse `argv`, returning `None` when help was printed and the program should stop.
 fn parse_args() -> Result<Option<Options>, String> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+/// The body of [`parse_args`], taking the arguments so that this can be tested.
+fn parse_args_from<I: Iterator<Item = String>>(mut args: I) -> Result<Option<Options>, String> {
     let mut options = Options::default();
-    let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -164,5 +184,37 @@ async fn wait_for_termination() {
     tokio::select! {
         _ = term.recv() => println!("\nSIGTERM empfangen, beende."),
         _ = interrupt.recv() => println!("\nSIGINT empfangen, beende."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args<'a>(list: &'a [&'a str]) -> impl Iterator<Item = String> + 'a {
+        list.iter().map(|a| a.to_string())
+    }
+
+    /// The help has to work while the phone is running, so asking for it must
+    /// not need the lock: `main` returns on `Ok(None)` before it takes it.
+    #[test]
+    fn asking_for_the_help_stops_before_anything_else() {
+        assert!(matches!(parse_args_from(args(&["--help"])), Ok(None)));
+        assert!(matches!(parse_args_from(args(&["-h"])), Ok(None)));
+        // Even with everything else asked for as well, and even behind the
+        // running instance's lock.
+        assert!(matches!(
+            parse_args_from(args(&["--no-web", "--help"])),
+            Ok(None)
+        ));
+    }
+
+    /// A run that is not the help goes on to take the lock.
+    #[test]
+    fn a_run_without_the_help_is_a_run() {
+        let options = parse_args_from(args(&["--no-web"]))
+            .expect("gültige Optionen")
+            .expect("kein Hilfeabruf");
+        assert!(options.no_web);
     }
 }

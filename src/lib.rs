@@ -9,13 +9,15 @@
 //! - [`webserver`] serves the status and configuration pages
 //! - [`phone`] is the state machine tying them together
 //! - [`gpio`] and [`callaudio`] talk to the hardware
-//! - [`command`] names the features, [`sync`] holds the locking helper
+//! - [`command`] names the features, [`sync`] holds the locking helper,
+//!   [`lockfile`] keeps a second instance off the hardware
 
 pub mod audio;
 pub mod callaudio;
 pub mod command;
 pub mod config;
 pub mod gpio;
+pub mod lockfile;
 pub mod pages;
 pub mod phone;
 pub mod sip;

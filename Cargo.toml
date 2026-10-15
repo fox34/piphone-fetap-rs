@@ -1,6 +1,6 @@
 [package]
 name = "piphone"
-version = "1.4.0"
+version = "1.4.1"
 authors = ["Steffen Manzer"]
 edition = "2021"
 rust-version = "1.91"
@@ -72,6 +72,9 @@ symphonia = { version = "0.6", default-features = false, features = [
 
 # HTTP Basic Auth decoding
 base64 = "0.23"
+
+# `flock` for the lock file that keeps a second instance off the hardware.
+libc = "0.2"
 
 # Hardware. Both crates are Linux-only and need the corresponding system
 # libraries, which Raspberry Pi OS provides (libgpiod 2.x, libasound2).

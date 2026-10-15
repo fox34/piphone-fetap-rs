@@ -2068,7 +2068,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "piphone"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "alsa",
  "axum",
@@ -2076,6 +2076,7 @@ dependencies = [
  "chrono",
  "gpiod",
  "http-body-util",
+ "libc",
  "rand 0.9.5",
  "regex",
  "rvoip",
