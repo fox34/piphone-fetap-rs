@@ -330,9 +330,9 @@ fn play(path: &str, device: &str, repeat: bool, stop: &AtomicBool) -> Result<(),
     };
 
     // Ask ALSA for the file's own format. The plug wrapper converts it to
-    // whatever the hardware actually wants.
+    // whatever the hardware actually wants. `configure` also sets the start
+    // threshold, so nothing has to start the stream here.
     configure(&pcm, rate, channels as u32)?;
-    pcm.start().map_err(|e| format!("Wiedergabe nicht startbar: {}", e))?;
 
     let io = pcm.io_i16().map_err(|e| format!("Wiedergabe-Format falsch: {}", e))?;
 
@@ -533,6 +533,19 @@ fn configure(pcm: &alsa::pcm::PCM, rate: u32, channels: u32) -> Result<(), Strin
     // Without applying the narrowed set the stream stays unconfigured and the
     // following `start` fails with an I/O error.
     pcm.hw_params(&hwp).map_err(|e| format!("Wiedergabe konnte nicht eingestellt werden: {}", e))?;
+
+    // Nothing calls `start` on this stream: ALSA starts it once a period of
+    // audio is queued. Starting it by hand instead means starting it on an
+    // empty buffer, which leaves the card clocking before there is anything to
+    // play. Playback otherwise defaults to a threshold of one whole buffer,
+    // which would add that much latency to every ringtone, so it is set to a
+    // single period here.
+    let hwp = pcm.hw_params_current().map_err(|e| e.to_string())?;
+    let period = hwp.get_period_size().map_err(|e| e.to_string())?;
+    let swp = pcm.sw_params_current().map_err(|e| e.to_string())?;
+    swp.set_start_threshold(period).map_err(|e| e.to_string())?;
+    pcm.sw_params(&swp).map_err(|e| e.to_string())?;
+
     Ok(())
 }
 
@@ -718,9 +731,8 @@ fn play_tone(tone: Tone, device: &str, stop: &AtomicBool) -> Result<(), String> 
         .map_err(|e| format!("Gerät \"{}\" nicht verfügbar: {}", device, e))?;
 
     // Unlike a file, the format is ours to choose; the wrapper converts it to
-    // whatever the hardware wants.
+    // whatever the hardware wants. `configure` also sets the start threshold.
     configure(&pcm, TONE_RATE, TONE_CHANNELS)?;
-    pcm.start().map_err(|e| format!("Wiedergabe nicht startbar: {}", e))?;
 
     let io = pcm.io_i16().map_err(|e| format!("Wiedergabe-Format falsch: {}", e))?;
 

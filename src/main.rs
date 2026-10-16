@@ -9,7 +9,8 @@ use piphone::webserver;
 use piphone::Phone;
 
 /// The version is taken from `Cargo.toml` through the environment, so the help
-/// cannot fall behind the package version.
+/// cannot fall behind the package version. The build date comes from
+/// `build.rs` the same way, so it cannot drift either.
 const HELP: &str = concat!(
     "\
 Steuerung für ein Raspberry-Pi-basiertes Headless-Telefon im Gehäuse alter Telefone (bspw. FeTAp).
@@ -17,6 +18,8 @@ Koordiniert Hörer, Lautsprecher, Gabelkontakt, Nummernschalter und SIP-Client (
 
 Version: ",
     env!("CARGO_PKG_VERSION"),
+    ", kompiliert ",
+    env!("DATE"),
     "
 
 Aufruf:

@@ -260,6 +260,9 @@ there; what it used to cost is left out.
 - **The tones are generated in memory** (`Tone`), not configured: the endless step is one second, which
   works only because every frequency completes whole cycles per second, and the loop checks the stop flag
   between short slices.
+- **Nothing calls `pcm.start()`**: `configure` sets `start_threshold` to one period, so ALSA starts the
+  stream when there is audio queued. An explicit `start` starts the card clocking on an *empty* buffer;
+  the playback default of a whole buffer would instead add that much latency to every sound.
 - **The earpiece is one channel shared by everything**: the ringback stops before the bridge takes the
   card, `play_earpiece_tone` silences the loudspeaker.
 
