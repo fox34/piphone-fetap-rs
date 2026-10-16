@@ -14,10 +14,12 @@
 //! Note that this is audible.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use piphone::audio::{Audio, Tone};
 use piphone::callaudio;
+use piphone::sip::FRAME_MS;
 
 /// How much slower than real time playback may get before the run is worth a
 /// look. Decoding MP3 on a Pi Zero 2W is not free, but the card should still
@@ -216,18 +218,64 @@ fn main() {
     // otherwise the busy tone that follows a call finds the device busy and
     // stays silent. This walks the path the phone takes when the other side
     // hangs up: hold the card, release it, then play.
+    //
+    // The card is released twice over in the real thing, because the end of a
+    // call arrives in two places at once: the SIP loop frees the card before it
+    // reports the end, and the audio pump frees it again as a backstop. So the
+    // busy tone is started the moment the *second* release returns - which is
+    // what the phone does when it hears about the end of the call, and it does
+    // not wait for the pump. A release that only emptied the slot would report
+    // the call over while the card was still open, and the tone starting then
+    // never gets to make a sound.
     println!("\nWählton nach einem Gespräch …");
+    let card = Arc::new(callaudio::CallAudio::default());
     {
-        let card = callaudio::CallAudio::default();
-        card.hold(callaudio::open_bridge(callaudio::CALL_DEVICE));
-        std::thread::sleep(Duration::from_millis(500));
+        let bridge = callaudio::open_bridge(callaudio::CALL_DEVICE);
+
+        // Frames in both directions, so the card is busy the way it is during a
+        // call rather than merely open.
+        let talker = std::thread::spawn({
+            let bridge = bridge.clone();
+            move || {
+                for _ in 0..25 {
+                    bridge.push_microphone(vec![0; callaudio::FRAME]);
+                    let _ = bridge.take_speaker();
+                    std::thread::sleep(Duration::from_millis(FRAME_MS));
+                }
+            }
+        });
+
+        card.hold(bridge);
+        talker.join().expect("Gesprächsrichtung");
+
+        // The audio pump gets there first and starts closing the streams.
+        let pump = {
+            let card = card.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                card.release();
+                started.elapsed()
+            })
+        };
+        std::thread::sleep(Duration::from_millis(2));
+
+        // The SIP loop follows a moment later and reports the end of the call,
+        // so the phone plays the busy tone right here.
+        let started = Instant::now();
         card.release();
+        let waited = started.elapsed();
+        audio.play_earpiece_tone(Tone::Besetzt);
+
+        let free = pump.join().expect("Freigeben der Audio-Pumpe");
+        println!(
+            "  Karte nach {:.0} ms frei; das zweite Freigeben hat {free:?} und {waited:?} gewartet.",
+            (free + waited).as_secs_f64() * 1000.0
+        );
     }
 
-    audio.play_earpiece_tone(Tone::Frei);
     std::thread::sleep(Duration::from_secs(2));
     if audio.earpiece.is_playing() {
-        println!("  Frei läuft nach der Brücke.");
+        println!("  Besetztton läuft nach der Brücke - das ist der Ton nach einem Gespräch.");
     } else {
         println!("  FEHLER: Nach einem Gespräch bleibt der Hörer stumm - die Brücke gibt die Karte nicht frei.");
         failures += 1;

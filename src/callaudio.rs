@@ -98,6 +98,12 @@ pub fn start(call: rvoip::sip::EndpointCall, device: &str, verbose: bool, card: 
 /// end first would lose the race: the busy tone it wants to play would look for
 /// a card that the conversation is still holding while it shuts down, find it
 /// busy, and stay silent.
+///
+/// The card is handed back under the lock rather than next to it, so that a
+/// release means the device is free and not that somebody is on the way to
+/// freeing it. Both [`CallAudio::release`] and [`CallAudio::hold`] stop the
+/// bridge they displace while holding it, which is what lets the SIP loop rely
+/// on the card being free once it has reported the end of the call.
 #[derive(Default)]
 pub struct CallAudio {
     bridge: Mutex<Option<Arc<dyn AudioBridge>>>,
@@ -108,9 +114,22 @@ impl CallAudio {
     ///
     /// Cheap when nobody holds it, so it can be called on every end of a call.
     pub fn release(&self) {
-        let bridge = lock(&self.bridge).take();
-        // Outside the lock: stopping a bridge waits for its ALSA threads.
-        if let Some(bridge) = bridge {
+        // Under the lock, for the whole handover: taking the bridge out of the
+        // slot is not the same as the device being free, and the bridge only
+        // lets go of the device once `stop` has joined its ALSA threads. Every
+        // end of a call comes through here twice - the SIP loop before it
+        // reports the end, and the audio pump as a backstop for the calls that
+        // end without such an event - and whoever arrived second used to find
+        // the slot empty, take that for a free card and go away at once. The
+        // phone was then told the call was over while the streams were still
+        // closing, and the busy tone it starts came up against a device that
+        // was still open: "Gerät usb nicht verfügbar: Device or resource
+        // busy", and an earpiece that stays silent when the other side hangs
+        // up. Waiting for the other caller is exactly what the second one was
+        // promised, and it costs it nothing: it would have to wait for the
+        // device anyway before anything of its own could use it.
+        let mut slot = lock(&self.bridge);
+        if let Some(bridge) = slot.take() {
             bridge.stop();
         }
     }
@@ -118,8 +137,13 @@ impl CallAudio {
     /// Register the bridge of the call that is up, which is to say: the card is
     /// taken from here on.
     pub fn hold(&self, bridge: Arc<dyn AudioBridge>) {
-        let previous = lock(&self.bridge).replace(bridge);
-        drop(previous);
+        // The bridge that had the card is stopped under the lock as well, so a
+        // release arriving in the middle waits for the handover instead of
+        // walking past a card that is changing hands.
+        let mut slot = lock(&self.bridge);
+        if let Some(previous) = slot.replace(bridge) {
+            previous.stop();
+        }
     }
 }
 
@@ -535,7 +559,7 @@ pub fn open_bridge(device: &str) -> Arc<dyn AudioBridge> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     #[test]
@@ -629,6 +653,67 @@ mod tests {
         // wait on a bridge that is gone.
         card.release();
         assert_eq!(stops.load(Ordering::SeqCst), 1, "zweimal freigeben darf nicht doppelt anhalten");
+    }
+
+    /// A bridge that needs a moment to let go of the card, standing in for one
+    /// whose ALSA threads have to be joined first.
+    struct SlowBridge {
+        /// How long `stop` takes.
+        delay: Duration,
+        /// Set once the card really has been given back.
+        released: Arc<AtomicBool>,
+    }
+
+    impl AudioBridge for SlowBridge {
+        fn push_microphone(&self, _samples: Vec<i16>) {}
+        fn take_speaker(&self) -> Option<Vec<i16>> {
+            None
+        }
+        fn stop(&self) {
+            std::thread::sleep(self.delay);
+            self.released.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A release has to mean the card is free, not that somebody is working on
+    /// freeing it.
+    ///
+    /// Every end of a call releases the card twice over: the SIP loop does it
+    /// before it reports the end, and the audio pump does it again as a
+    /// backstop. Whichever of the two arrives second used to find the slot
+    /// empty - the first had already taken the bridge out of it - and go away
+    /// at once, so the phone was told the call was over while the device was
+    /// still open and the busy tone it wants to play came up against a busy
+    /// card. That is the earpiece going silent when the other side hangs up.
+    #[test]
+    fn a_second_release_waits_for_the_card_the_first_one_is_handing_back() {
+        let delay = Duration::from_millis(300);
+        let card = Arc::new(CallAudio::default());
+        let released = Arc::new(AtomicBool::new(false));
+        card.hold(Arc::new(SlowBridge {
+            delay,
+            released: released.clone(),
+        }));
+
+        // The pump gets there first and starts closing the streams.
+        let first = {
+            let card = card.clone();
+            std::thread::spawn(move || card.release())
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!released.load(Ordering::SeqCst), "der erste gibt die Karte noch frei");
+
+        // The SIP loop follows a moment later and reports the end of the call.
+        let started = std::time::Instant::now();
+        card.release();
+        let waited = started.elapsed();
+
+        first.join().expect("erstes Freigeben");
+        assert!(released.load(Ordering::SeqCst), "nach beiden Freigaben ist die Karte frei");
+        assert!(
+            waited >= delay / 2,
+            "das zweite Freigeben kam nach {waited:?} zurück, während die Karte noch belegt war"
+        );
     }
 
     #[test]

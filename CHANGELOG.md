@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.4
+
+Fixes:
+
+- Restore the busy tone after remote hangup.
+
 ## 1.4.3
 
 Fixes:
