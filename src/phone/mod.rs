@@ -13,7 +13,7 @@ mod schedule;
 mod web;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -84,7 +84,6 @@ pub struct Phone {
     config: Table,
     /// Normalised configuration as a baseline for the web interface.
     baseline: Mutex<Table>,
-    config_mtime: Mutex<f64>,
 
     audio: Audio,
     led: Arc<Led>,
@@ -274,8 +273,6 @@ impl Phone {
             }
         }
 
-        let config_mtime = modified(&options.config).unwrap_or(0.0);
-
         let gpio = Gpio::new()?;
 
         let led = Arc::new(Led::new(
@@ -315,7 +312,6 @@ impl Phone {
             options,
             config,
             baseline: Mutex::new(baseline),
-            config_mtime: Mutex::new(config_mtime),
             audio: Audio::default(),
             led,
             hungup,
@@ -1236,14 +1232,6 @@ async fn reachable(host: &str) -> bool {
         Ok(Ok(_)) => true,
         _ => false,
     }
-}
-
-/// Modification time of a file, used to notice changes from outside.
-fn modified(path: &Path) -> Option<f64> {
-    let metadata = std::fs::metadata(path).ok()?;
-    let modified = metadata.modified().ok()?;
-    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
-    Some(since_epoch.as_secs_f64())
 }
 
 /// Borrow a section of the configuration as a mutable table.

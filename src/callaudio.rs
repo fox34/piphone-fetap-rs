@@ -206,6 +206,15 @@ pub mod alsa {
     use crate::sip::AudioBridge;
     use crate::sync::lock;
 
+    /// How often a stream may be put back to work before the call is given up
+    /// on.
+    ///
+    /// Only unbroken trouble counts: every frame that gets through resets the
+    /// count, so a card that glitches now and then never reaches this, while
+    /// one that recovers and then refuses the very next frame does, instead of
+    /// being retried forever.
+    const RECOVERIES: u32 = 10;
+
     /// Playback and capture on the USB sound card.
     pub struct UsbBridge {
         /// Samples from the caller waiting for the earpiece.
@@ -217,6 +226,12 @@ pub mod alsa {
         ///
         /// The card is only really free once they have returned and dropped
         /// their handles, which is why [`UsbBridge::stop`] joins them.
+        ///
+        /// [`UsbBridge::stop`] holds this lock across the joins, and the joins
+        /// wait on ALSA - so a thread body that locked this itself would deadlock
+        /// the shutdown path instead of merely delaying it. Neither body does:
+        /// they are handed the stream, the queues and the `active` flag, and have
+        /// no way back to the bridge. Keep it that way.
         threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     }
 
@@ -298,28 +313,23 @@ pub mod alsa {
                             return;
                         }
                     };
-                    let mut samples = vec![0i16; FRAME];
+                    // Written straight from the queue's own frame, so what arrives off the
+                    // wire reaches the card without a copy. Only the idle case
+                    // needs a buffer of its own, and it never changes.
+                    let silence = vec![0i16; FRAME];
+                    // Frames that could not be written without recovering;
+                    // see [`write_frame`].
+                    let mut stalled = 0;
 
                     while active.load(Ordering::SeqCst) {
-                        // One buffer for the whole call, refilled on every pass:
-                        // this runs fifty times a second for as long as the call
-                        // lasts, and it used to be a `Vec` allocation per pass.
-                        // `resize` rather than `copy_from_slice`, because a frame
-                        // off the wire is not guaranteed to be one frame long and
-                        // must not panic this thread over it.
-                        match queue.pop() {
-                            Some(received) => {
-                                samples.clear();
-                                samples.extend_from_slice(&received);
-                            }
-                            // Silence when idle, so the card keeps running and
-                            // the earpiece does not click between frames.
-                            None => {
-                                samples.clear();
-                                samples.resize(FRAME, 0);
-                            }
-                        }
-                        if let Err(e) = io.writei(&samples) {
+                        let frame = queue.pop();
+                        // Silence when idle, so the card keeps running and
+                        // the earpiece does not click between frames.
+                        let samples: &[i16] = match frame.as_deref() {
+                            Some(received) => received,
+                            None => &silence,
+                        };
+                        if let Err(e) = Self::write_frame(&io, &pcm, samples, &mut stalled) {
                             eprintln!("Wiedergabe fehlgeschlagen: {}", e);
                             active.store(false, Ordering::SeqCst);
                             return;
@@ -348,15 +358,36 @@ pub mod alsa {
                         }
                     };
                     let mut buffer = vec![0i16; FRAME];
+                    // Reads that had to be recovered; see [`write_frame`].
+                    let mut stalled = 0;
 
                     while active.load(Ordering::SeqCst) {
                         match io.readi(&mut buffer) {
                             Ok(0) => thread::sleep(Duration::from_millis(1)),
-                            Ok(count) => queue.push(buffer[..count].to_vec()),
+                            // One allocation per frame, and unlike the playback
+                            // side it cannot be pooled away: `readi` borrows the
+                            // buffer but `EndpointAudioFrame` owns its samples
+                            // and `send` takes the frame by value, so this copy
+                            // is the hand-off of ownership into rvoip, not a
+                            // leftover. Playback can reuse one buffer because
+                            // `writei` only borrows; here the samples leave the
+                            // process and nothing gives them back.
+                            Ok(count) => {
+                                stalled = 0;
+                                queue.push(buffer[..count].to_vec());
+                            }
                             Err(e) => {
-                                eprintln!("Aufnahme fehlgeschlagen: {}", e);
-                                active.store(false, Ordering::SeqCst);
-                                return;
+                                // An overrun - the microphone filled up while
+                                // nobody was reading - ends the stream just as
+                                // an underrun ends playback, and is resumed the
+                                // same way; see `write_frame`.
+                                let message = e.to_string();
+                                if stalled >= RECOVERIES || pcm.try_recover(e, true).is_err() {
+                                    eprintln!("Aufnahme fehlgeschlagen: {}", message);
+                                    active.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                                stalled += 1;
                             }
                         }
                     }
@@ -364,6 +395,61 @@ pub mod alsa {
                 .map_err(|e| format!("Aufnahme-Thread nicht startbar: {}", e))?;
 
             self.remember_thread(handle);
+            Ok(())
+        }
+
+        /// Hand one frame to ALSA, putting the stream back to work if it has fallen
+        /// behind.
+        ///
+        /// `writei` reports frames, not samples, and is allowed to take fewer
+        /// than offered, so the remainder is written in a loop rather than
+        /// dropped - the same rule [`crate::audio`] follows for the earpiece.
+        /// Mono here, so a frame is a single sample and the count needs no
+        /// scaling.
+        ///
+        /// A refused frame is nearly always an underrun, and ALSA can resume
+        /// from one, so the stream is restarted rather than the call being
+        /// given up on: measured on the USB codec, an unrecovered underrun
+        /// leaves the stream in `XRun` for good - every later write fails -
+        /// so without this a single xrun silences the earpiece until the call
+        /// ends. `snd_pcm_recover` hands back the error unchanged for anything
+        /// it cannot resume, which is what leaves genuinely fatal errors - a
+        /// card that is gone - on the caller's own error path.
+        ///
+        /// `stalled` bounds the attempts, so a stream that recovers but will
+        /// not carry a frame cannot be retried forever; it is zeroed by every
+        /// frame that does go through, so only unbroken trouble counts.
+        fn write_frame(
+            io: &alsa::pcm::IO<i16>,
+            pcm: &alsa::pcm::PCM,
+            samples: &[i16],
+            stalled: &mut u32,
+        ) -> Result<(), String> {
+            let mut written = 0;
+
+            while written < samples.len() {
+                match io.writei(&samples[written..]) {
+                    // No progress means the stream is not going to take the rest.
+                    Ok(0) => return Err("kein Fortschritt".to_string()),
+                    Ok(frames) => written += frames,
+                    Err(e) => {
+                        if *stalled >= RECOVERIES {
+                            return Err(e.to_string());
+                        }
+                        *stalled += 1;
+
+                        if let Err(unrecovered) = pcm.try_recover(e, true) {
+                            return Err(unrecovered.to_string());
+                        }
+
+                        // The stream was reset, so whatever it had already
+                        // taken is gone: the frame starts over from the top.
+                        written = 0;
+                    }
+                }
+            }
+
+            *stalled = 0;
             Ok(())
         }
 

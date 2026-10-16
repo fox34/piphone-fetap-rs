@@ -688,26 +688,6 @@ impl Watcher {
     }
 }
 
-/// Watch the hook switch on its own, without the dial.
-///
-/// Used by the tests and by setups that do not use a rotary dial.
-pub fn watch_hook(watcher: &mut Watcher, on_hook: &mut dyn FnMut(bool)) -> ! {
-    let mut digits = Vec::new();
-
-    loop {
-        for change in watcher.contacts.wait(watcher.wake_after()) {
-            watcher.apply(change, &mut digits);
-        }
-
-        watcher.advance(watcher.now(), &mut digits);
-        digits.clear(); // without a dial there is nothing to decode
-
-        if let Some(hooked) = watcher.settle() {
-            on_hook(hooked);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -43,7 +43,6 @@ fn print_fixture() {
     let payload = serde_json::json!({
         "sections": config::describe(&data),
         "sounds": sounds::describe(&absent_sounds()),
-        "mtime": 1_700_000_000.0,
     });
 
     println!("{}", serde_json::to_string_pretty(&payload).expect("JSON schreiben"));

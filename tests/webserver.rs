@@ -42,7 +42,6 @@ impl PhoneApi for StubPhone {
         json!({
             "sections": config::describe(&example()),
             "sounds": sounds::describe(&self.sounds),
-            "mtime": 1000.0,
         })
     }
 

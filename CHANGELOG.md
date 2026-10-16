@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.4.3
+
+Fixes:
+
+- A sound card that loses its place during a call is put back to work instead of
+  silencing the conversation until it ends.
+- The status page no longer reports two unused fields: `hungup` and the
+  configuration file's `mtime`.
+
 ## 1.4.2
 
 Fixes:

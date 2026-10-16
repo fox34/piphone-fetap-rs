@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use serde_json::Value as Json_;
 
-use super::{modified, Phone};
+use super::Phone;
 use crate::command::Command;
 use crate::config;
 use crate::sounds;
@@ -26,7 +26,6 @@ impl PhoneApi for Arc<Phone> {
             "connected": self.is_connected.load(Ordering::SeqCst),
             "sip_registered": self.sip_registered.load(Ordering::SeqCst),
             "call_active": self.call_up.load(Ordering::SeqCst),
-            "hungup": self.is_hungup(),
             "night_light": self.led.night_light_on_state(),
             "wake_up_mode": self.led.wake_light_on_state(),
             "sleep_music": self.sleep_music_running.load(Ordering::SeqCst),
@@ -49,7 +48,6 @@ impl PhoneApi for Arc<Phone> {
             // ganzen Abschnitt, und ein zweiter Abruf nur für die Klänge wäre
             // eine zweite Wahrheit, die nach dem Speichern auseinanderlaufen kann.
             "sounds": sounds::describe(&self.options.sounds_dir),
-            "mtime": *lock(&self.config_mtime),
         })
     }
 
@@ -92,7 +90,6 @@ impl PhoneApi for Arc<Phone> {
         }
 
         *lock(&self.baseline) = saved.cleaned;
-        *lock(&self.config_mtime) = modified(&self.options.config).unwrap_or(0.0);
 
         if !changed.is_empty() {
             self.restart();
