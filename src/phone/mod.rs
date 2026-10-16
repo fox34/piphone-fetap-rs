@@ -721,6 +721,8 @@ impl Phone {
         self.call_incoming.store(true, Ordering::SeqCst);
         self.audio.stop_earpiece();
         self.audio.play_speaker_repeat(&self.ringtone_for(caller));
+        // The status LED blinks along with the ringtone.
+        self.led.wake_light_blink();
 
         // Hand the decision to the hook handler and give up after the ring timeout.
         *lock(&self.pending_call) = Some(reply);
@@ -749,6 +751,7 @@ impl Phone {
         self.stop_ring_timeout();
         self.call_incoming.store(false, Ordering::SeqCst);
         self.audio.stop_speaker();
+        self.led.wake_light_unblink();
 
         match reply {
             // Answering and declining both happen inside the SIP task.
@@ -796,6 +799,7 @@ impl Phone {
         *lock(&self.pending_call) = None;
 
         self.audio.stop_speaker();
+        self.led.wake_light_unblink();
         self.stop_call_duration_timer();
 
         // The handset is off the cradle: it is waiting for the next number. The
@@ -1313,5 +1317,44 @@ mod tests {
     #[test]
     fn a_systemctl_that_cannot_run_reports_failure() {
         assert!(!systemctl(&["this-subcommand-does-not-exist"]));
+    }
+
+    /// The status LED blinks while the phone rings, and stops when it stops.
+    ///
+    /// The blink belongs next to the ringtone and belongs to every path that ends
+    /// the ringing. It has to be ended and not just started: an LED still
+    /// blinking after the call is over announces a call that is not there, and
+    /// the one blink that is never ended - the boot signal - shows what that
+    /// looks like. The two paths are the two that already stop the loudspeaker,
+    /// so the light cannot be left behind on either.
+    ///
+    /// Textual, like the checks above: the blink is two GPIO writes a second.
+    #[test]
+    fn the_status_led_blinks_as_long_as_the_phone_rings() {
+        let source = include_str!("mod.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("Quelle vor den Tests");
+
+        let body = |name: &str| {
+            source
+                .split(name)
+                .nth(1)
+                .and_then(|rest| rest.split("\n    }").next())
+                .unwrap_or_else(|| panic!("{} steht nicht in phone/mod.rs", name))
+        };
+
+        assert!(
+            body("fn incoming_call").contains("wake_light_blink"),
+            "der Klingelton beginnt ohne blinkende Statusleuchte."
+        );
+
+        for path in ["fn hang_up_incoming", "fn hung_up"] {
+            assert!(
+                body(path).contains("wake_light_unblink"),
+                "{} beendet das Klingeln, ohne die Statusleuchte ausblenden zu lassen.",
+                path
+            );
+        }
     }
 }

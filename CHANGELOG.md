@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.5
+
+Features:
+
+- The green status LED blinks while an incoming call rings.
+
 ## 1.4.4
 
 Fixes:

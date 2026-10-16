@@ -109,8 +109,11 @@ const NSA_DEBOUNCE: u32 = 10;
 /// flickers again, raise it - the CPU is cheap, the flicker is not.
 const PWM_FREQUENCY: f64 = 500.0;
 
-/// Blink frequency for the status LED during boot.
+/// Blink frequency for the status LED, in Hz.
 const BLINK_FREQUENCY: f64 = 1.0;
+
+/// Brightness of the status LED blink, in percent.
+const BLINK_DUTY: f64 = 50.0;
 
 // -----------------------------------------------------------------------------
 // LEDs
@@ -119,9 +122,9 @@ const BLINK_FREQUENCY: f64 = 1.0;
 /// The two half-periods of a software PWM, or `None` when `duty` sits at an end
 /// of its range and the pin can be driven to a constant level instead.
 ///
-/// `frequency` only matters for the blink during boot; the night and wake lights
-/// always run at [`PWM_FREQUENCY`], which is far enough above the flicker fusion
-/// threshold of a bare LED that it cannot show one.
+/// `frequency` only matters for a blink; the night and wake lights always run
+/// at [`PWM_FREQUENCY`], which is far enough above the flicker fusion threshold
+/// of a bare LED that it cannot show one.
 fn timings(duty: f64, frequency: f64) -> Option<(Duration, Duration)> {
     let duty = duty.clamp(0.0, 100.0);
 
@@ -259,6 +262,16 @@ pub struct Led {
     wake: Option<Mutex<Output>>,
     wake_duty: f64,
     wake_on: AtomicBool,
+    /// A blink is running on the status LED, so ending it has to stop the PWM
+    /// thread.
+    ///
+    /// Not the same thing as `wake_restore`: a blink over a dark light still has
+    /// to be stopped, and `wake_light_unblink` is also reached for calls that
+    /// never rang at all.
+    wake_blinking: AtomicBool,
+    /// The status LED was lit before that blink started and has to be lit again
+    /// when it ends. See [`Led::wake_light_blink`].
+    wake_restore: AtomicBool,
 }
 
 impl Led {
@@ -304,6 +317,8 @@ impl Led {
             wake: wake.map(Mutex::new),
             wake_duty: wake_light_duty,
             wake_on: AtomicBool::new(false),
+            wake_blinking: AtomicBool::new(false),
+            wake_restore: AtomicBool::new(false),
         })
     }
 
@@ -349,19 +364,94 @@ impl Led {
 
     /// Switch the wake-up light on, optionally at a different brightness.
     pub fn wake_light_on(&self, duty_cycle: Option<f64>) {
+        // An explicit switch wins over a blink: whoever changed the light on
+        // purpose has said what it should be, so a blink owes nothing back.
+        self.wake_blinking.store(false, Ordering::SeqCst);
+        self.wake_restore.store(false, Ordering::SeqCst);
         Self::set_light(&self.wake, &self.wake_on, self.wake_duty, true, duty_cycle);
     }
 
     /// Switch the wake-up light off.
     pub fn wake_light_off(&self) {
+        self.wake_blinking.store(false, Ordering::SeqCst);
+        self.wake_restore.store(false, Ordering::SeqCst);
         Self::set_light(&self.wake, &self.wake_on, self.wake_duty, false, None);
     }
 
-    /// Blink the status LED while booting, so the phone signals that it starts.
+    /// Blink the status LED at [`BLINK_FREQUENCY`]: while booting, so the phone
+    /// signals that it starts, and while an incoming call rings.
+    ///
+    /// The blink *borrows* the light instead of taking it. A wake-up mode that is
+    /// still running keeps its claim and gets its steady light back from
+    /// [`Led::wake_light_unblink`] - there is no timer left that would bring it
+    /// back, so switching it off when the call ends would leave it dark for the
+    /// rest of its two hours.
+    ///
+    /// `wake_light_on_state` stays false throughout: a call that is ringing is
+    /// not the wake-up mode, and the web interface says which is which.
     pub fn wake_light_blink(&self) {
+        // Remembered unconditionally: a blink over a dark light has to give it
+        // back dark, one over a lit light has to give it back lit.
+        self.wake_restore.store(self.wake_on.load(Ordering::SeqCst), Ordering::SeqCst);
+        self.wake_blinking.store(true, Ordering::SeqCst);
+
         if let Some(output) = &self.wake {
             let mut output = lock(&output);
-            output.start_pwm(50.0, BLINK_FREQUENCY);
+            output.start_pwm(BLINK_DUTY, BLINK_FREQUENCY);
+        }
+    }
+
+    /// Stop the blink and put the wake-up light back the way the blink found it.
+    ///
+    /// Both of the two outcomes have to *do* something, and that is why this is a
+    /// match over [`AfterBlink`] and not an early return. Returning early when
+    /// there was nothing to hand back left the PWM thread running - which is the
+    /// ordinary case, a call ringing while the light is dark - and the status LED
+    /// went on blinking long after the call had ended.
+    ///
+    /// The guard is the other half, and it is not the same question. This is also
+    /// reached for calls that never rang: one declined by do-not-disturb, or the
+    /// end of a conversation. Switching the wake-up light off there would end a
+    /// wake-up mode over a call that had nothing to do with it.
+    pub fn wake_light_unblink(&self) {
+        let what = AfterBlink::of(
+            self.wake_blinking.swap(false, Ordering::SeqCst),
+            self.wake_restore.swap(false, Ordering::SeqCst),
+        );
+
+        match what {
+            // No blink is running, so the light is not ours to touch.
+            AfterBlink::Unchanged => {}
+            AfterBlink::Lit => self.wake_light_on(None),
+            AfterBlink::Dark => self.wake_light_off(),
+        }
+    }
+}
+
+/// What ending a blink does to the wake-up light.
+///
+/// The three cases are spelled out because two of them are one line each and a
+/// missing one is silent: no blink means the light must not be touched at all,
+/// and both blinks that did run have to put the light back the way they found it.
+/// See [`Led::wake_light_unblink`].
+#[derive(Debug, PartialEq)]
+enum AfterBlink {
+    /// No blink is running: the light belongs to somebody else.
+    Unchanged,
+    /// The blink borrowed a lit light and gives it back lit.
+    Lit,
+    /// The blink borrowed a dark light and gives it back dark.
+    Dark,
+}
+
+impl AfterBlink {
+    /// `blinking` is whether a blink was running, `restore` whether the light
+    /// was on before it started.
+    fn of(blinking: bool, restore: bool) -> Self {
+        match (blinking, restore) {
+            (false, _) => AfterBlink::Unchanged,
+            (true, true) => AfterBlink::Lit,
+            (true, false) => AfterBlink::Dark,
         }
     }
 }
@@ -749,6 +839,65 @@ mod tests {
     fn an_even_duty_splits_the_period_evenly() {
         let (on, off) = timings(50.0, PWM_FREQUENCY).expect("half duty needs a thread");
         assert_eq!(ns(on), ns(off));
+    }
+
+    #[test]
+    fn a_blink_gives_the_light_back_to_whoever_had_it() {
+        // The wake-up mode keeps its light, the phone in its normal state does
+        // not: the blink borrowed a light that was dark and must leave it dark.
+        assert_eq!(AfterBlink::of(true, false), AfterBlink::Dark);
+        assert_eq!(AfterBlink::of(true, true), AfterBlink::Lit);
+    }
+
+    #[test]
+    fn ending_no_blink_leaves_the_light_alone() {
+        // Both ways of not having a blink, and both of them have to be
+        // "leave it alone": this is the case of a call that never rang - declined
+        // by do-not-disturb, or the end of a conversation - and switching the
+        // wake-up light off there ends a wake-up mode over a call that had
+        // nothing to do with it.
+        assert_eq!(AfterBlink::of(false, false), AfterBlink::Unchanged);
+        assert_eq!(AfterBlink::of(false, true), AfterBlink::Unchanged);
+    }
+
+    /// Ending a blink has to switch the light in *both* of its running cases, and
+    /// has to leave it alone in the third.
+    ///
+    /// Textual, because `Led` needs a GPIO controller: an early return for the
+    /// "nothing to give back" case only showed up on the real pin, and so did the
+    /// switch-off for a call that never rang. Only the text can be checked
+    /// without the hardware, so all three arms are spelled out here.
+    #[test]
+    fn ending_a_blink_reaches_a_light_switch_in_every_running_case() {
+        let source = include_str!("gpio.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("Quelle vor den Tests");
+
+        let body = source
+            .split("pub fn wake_light_unblink")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }").next())
+            .expect("wake_light_unblink");
+
+        assert!(
+            body.contains("wake_light_on") && body.contains("wake_light_off"),
+            "ein Blinksignal muss die Leuchte in beiden laufenden Fällen schalten."
+        );
+
+        // The arm for "no blink is running" must stay empty. It is the one that
+        // ends a wake-up mode when a call never rang.
+        let unchanged = body
+            .split("AfterBlink::Unchanged")
+            .nth(1)
+            .and_then(|rest| rest.split('\n').next())
+            .expect("der Unchanged-Arm");
+
+        assert!(
+            unchanged.contains("{}"),
+            "ohne laufendes Blinksignal darf die Leuchte nicht geschaltet werden, \
+             sonst beendet ein Anruf, der nie geklingelt hat, den Aufwachmodus."
+        );
     }
 
     /// Drive a full dial rotation of `pulses` impulses and return the digit.

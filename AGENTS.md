@@ -218,6 +218,20 @@ there; what it used to cost is left out.
   under load instead: brightness is the duty, the frequency only has to stay flicker-free.
 - **Duty 0 or 100 is a plain level**: `timings` clamps and returns `None`, so there is no thread with a
   zero-length half period.
+- **The status LED blinks while an incoming call rings, at 1 Hz and half duty** - next to the ringtone,
+  and ended on both paths that end the ringing. A blink *borrows* the light: it does not set
+  `wake_light_on_state`, so the web interface does not report wake-up mode for a call, and
+  `wake_light_unblink` puts a still-running wake-up mode back rather than switching its light off - there
+  is no timer left that would bring it back. An explicit `wake_light_on`/`wake_light_off` clears the
+  claim, so toggling night mode during a call wins over the blink.
+- **Ending a blink touches the wake-up light in exactly one of three cases**, which is why it is a `match`
+  over `AfterBlink`: a blink that was running has to put the light back the way it found it - *both* ways,
+  because a return for the ordinary case (a call ringing while the light is dark) skipped the `stop_pwm`
+  and left the LED blinking for the rest of the run - and a call that never rang has to leave it alone,
+  because `hung_up` reaches this for those too. The second version of that fix got the second half wrong
+  and switched the wake-up light off over a call declined by do-not-disturb; both mistakes only the real
+  pin showed. `wake_blinking` is the guard and `wake_restore` the thing to give back - they are not the
+  same question.
 - **The PWM thread is started with `thread::Builder` and its error is reported**, not `thread::spawn`,
   which panics - and under `panic = "abort"` a Pi Zero that cannot start one more thread would lose the
   phone over a dimmed LED. Every other thread in the crate already reports rather than panics.
